@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.159.1",
+    "google-genai>=2.32.0",
     "langchain-google-genai>=4.4.2",
     "langchain-mcp-adapters>=0.3.2",
     "langchain-openai>=1.7.2",
@@ -14,5 +15,6 @@ dependencies = [
     "mcp[cli]>=1.30.0",
     "psycopg[binary]>=3.3.6",
     "pymilvus>=3.0.2",
+    "python-dotenv>=1.2.4",
     "uvicorn>=0.54.0",
 ]

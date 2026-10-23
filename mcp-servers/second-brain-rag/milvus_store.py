@@ -1,11 +1,28 @@
 from pymilvus import MilvusClient, DataType
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pathlib import Path
+import os
+import numpy as np
+
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
 class SecondBrainStore:
     def __init__(self, uri: str = "http://localhost:19530", token: str = ""):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("Not found GEMINI_API_KEY in .env!")
+
+        self.genai_client = genai.Client(api_key=api_key)
+        self.embedding_model = "gemini-embedding-001"
+        self.dim = 768
+
         self.client = MilvusClient(uri=uri, token=token)
-        self.collection_name = "personal_knowledge"
+        self.collection_name = "personal_knowledge_v2"
         self.dim = 768 
         self._init_collection()
 
@@ -36,11 +53,17 @@ class SecondBrainStore:
         )
 
     def _get_embedding(self, text: str) -> List[float]:
-        # TODO: Replace by real model/api
-        import hashlib, random
-        seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
-        rng = random.Random(seed)
-        return [rng.uniform(-1.0, 1.0) for _ in range(self.dim)]
+        """Call the Gemini Embedding API for free to obtain a 768-dimensional vector"""
+        response = self.genai_client.models.embed_content(
+            model=self.embedding_model,
+            contents=text,
+            config=types.EmbedContentConfig(
+                output_dimensionality=self.dim
+            )
+        )
+        vec = np.array(response.embeddings[0].values)
+        norm_vec = vec / np.linalg.norm(vec)
+        return norm_vec.tolist()
 
     def add_document(self, text: str, source_file: str, doc_type: str = "note") -> int:
         vector = self._get_embedding(text)

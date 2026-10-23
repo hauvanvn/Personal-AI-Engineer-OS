@@ -11,3 +11,6 @@ wheels/
 
 # Volume
 volumes/
+
+# Enviroment configuation
+.env
