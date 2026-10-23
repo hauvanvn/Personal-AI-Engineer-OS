@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Annotated, TypedDict, List
 from dotenv import load_dotenv
@@ -11,6 +12,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 
 # Load load .env file
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -50,55 +52,73 @@ async def run_orchestrator():
     )
 
     # Auto get MCP Server Tool list and tranform to LangChain/LangGraph
-    mcp_tools = await mcp_client.get_tools()
-    print(f"[*] Successfuly get {len(mcp_tools)} MCP Tools: {[t.name for t in mcp_tools]}")
+    t0 = time.perf_counter()
+    async with mcp_client.session("second_brain") as session:
+        mcp_tools = await load_mcp_tools(session=session)
+        print(f"[*] Initialize MCP Session & Connected in: {time.perf_counter() - t0:.2f}s")
+        print(f"[*] Successfuly get {len(mcp_tools)} MCP Tools: {[t.name for t in mcp_tools]}")
 
-    # Initialize LLM and bind MCP Tools
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-3.8-flash", 
-        google_api_key=GEMINI_API_KEY, 
-        temperature=0.1,
-        max_retries=5, # Automatically wait and retry (Exponential Backoff) if a 429 error occurs on the Free Tier
+        # Initialize LLM and bind MCP Tools
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-3.5-flash-lite", 
+            google_api_key=GEMINI_API_KEY, 
+            # temperature=0.1,
+            max_retries=5, # Automatically wait and retry (Exponential Backoff) if a 429 error occurs on the Free Tier
+            transport="rest",
+            timeout=15.0,
+            )
+        llm_with_tools = llm.bind_tools(mcp_tools)
+
+        # Define main deduce Node
+        async def planner_node(state: AgentState):
+            step_t0 = time.perf_counter()
+            messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+            response = await llm_with_tools.ainvoke(messages)
+            print(f"  [LLM Planer] Response in: {time.perf_counter() - step_t0:.2f}s")
+            return {"messages": [response]}
+
+        raw_tool_node = ToolNode(mcp_tools)
+        async def time_tool_node(state: AgentState):
+            step_t0 = time.perf_counter()
+            res = await raw_tool_node.ainvoke(state)
+            print(f"  [MCP Tool & Milvus] Executed in: {time.perf_counter() - step_t0:.2f}s")
+            return res
+
+
+        # LangGraph Graph Assembly
+        builder = StateGraph(AgentState)
+        builder.add_node("planner", planner_node)
+        builder.add_node("mcp_tools", time_tool_node)
+
+        builder.add_edge(START, "planner")
+        builder.add_conditional_edges(
+            "planner",
+            tools_condition, # Automatically branch to "mcp_tools" if the LLM decides to call a tool
+            {"tools": "mcp_tools", END: END}
         )
-    llm_with_tools = llm.bind_tools(mcp_tools)
+        builder.add_edge("mcp_tools", "planner") # After obtaining the results from MCP, return to the Planner to consolidate them
 
-    # Define main deduce Node
-    async def planner_node(state: AgentState):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-        response = await llm_with_tools.ainvoke(messages)
-        return {"messages": [response]}
+        # Mount a Checkpointer to retain conversation context based on thread_id
+        memory = MemorySaver() # In the actual API version, this will be replaced by AsyncPostgresSaver
+        graph = builder.compile(checkpointer=memory)
 
-    # LangGraph Graph Assembly
-    builder = StateGraph(AgentState)
-    builder.add_node("planner", planner_node)
-    builder.add_node("mcp_tools", ToolNode(mcp_tools))
+        # End-to-End test
+        config = {"configurable": {"thread_id": "ben_dev_session_02"}}
 
-    builder.add_edge(START, "planner")
-    builder.add_conditional_edges(
-        "planner",
-        tools_condition, # Automatically branch to "mcp_tools" if the LLM decides to call a tool
-        {"tools": "mcp_tools", END: END}
-    )
-    builder.add_edge("mcp_tools", "planner") # After obtaining the results from MCP, return to the Planner to consolidate them
+        print("\n-- TEST 1: Ask Assistant save architechture into Second Brain ---")
+        start_step1 = time.perf_counter()
+        msg1 = "Please add the following content to the architecture notes (file: thesis_backend.md, doc_type: architechture): The thesis system uses NestJS as the primary backend, incorporating BullMQ and Redis to handle the video OCR queue."
+        async for event in graph.astream({"messages": [HumanMessage(content=msg1)]}, config, stream_mode="values"):
+            event["messages"][-1].pretty_print()
+        print(f"-> Total time of TEST 1: {time.perf_counter() - start_step1:.2f}s")
+        await asyncio.sleep(2)
 
-    # Mount a Checkpointer to retain conversation context based on thread_id
-    memory = MemorySaver() # In the actual API version, this will be replaced by AsyncPostgresSaver
-    graph = builder.compile(checkpointer=memory)
-
-    # End-to-End test
-    config = {"configurable": {"thread_id": "ben_dev_session_01"}}
-
-    print("\n-- TEST 1: Ask Assistant save architechture into Second Brain ---")
-    msg1 = "Please add the following content to the architecture notes (file: graduation_arch.md): The thesis system uses NestJS as the primary backend, incorporating BullMQ and Redis to handle the video OCR queue."
-    async for event in graph.astream({"messages": [HumanMessage(content=msg1)]}, config, stream_mode="values"):
-        event["messages"][-1].pretty_print()
-
-    await asyncio.sleep(2)
-
-    print("\n--- TEST 2: Querying knowledge via RAG MCP ---")
-    msg2 = "Check my `Second Brain` to see what technology I'm using to process the video OCR queue?"
-    async for event in graph.astream({"messages": [HumanMessage(content=msg2)]}, config, stream_mode="values"):
-        event["messages"][-1].pretty_print()
+        print("\n--- TEST 2: Querying knowledge via RAG MCP ---")
+        start_step2 = time.perf_counter()
+        msg2 = "Check my `Second Brain` to see what technology I'm using to process the video OCR queue?"
+        async for event in graph.astream({"messages": [HumanMessage(content=msg2)]}, config, stream_mode="values"):
+            event["messages"][-1].pretty_print()
+        print(f"-> Total time of TEST 2: {time.perf_counter() - start_step2:.2f}s")
 
 if __name__ == "__main__":
     asyncio.run(run_orchestrator())
