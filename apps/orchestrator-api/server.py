@@ -202,18 +202,33 @@ class ResumeRequest(BaseModel):
 async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
     """Check if the graph completed normally or paused at a Human-in-the-Loop interrupt."""
     state = await graph.aget_state(config)
+    messages = state.values.get("messages", [])
+
+    # Extract recent tool executions from the current turn to visualize on the UI
+    tool_traces = []
+    for m in reversed(messages):
+        if m.type == "human":
+            break
+        if m.type == "tool":
+            tool_traces.append(
+                {
+                    "tool_name": m.name,
+                    "output": extract_clean_text(m.content),
+                }
+            )
+    tool_traces.reverse()
+
     if state.next and "safety_gatekeeper" in state.next:
         interrupt_val = state.tasks[0].interrupts[0].value
         return {
             "status": "interrupted_for_approval",
             "thread_id": config["configurable"]["thread_id"],
             "pending_approval": interrupt_val,
+            "tool_traces": tool_traces,
         }
 
-    messages = state.values.get("messages", [])
     final_text = extract_clean_text(messages[-1].content) if messages else ""
 
-    # Pass full message list so the extractor can see HumanMessage prior to MCP ToolCalls
     if messages:
         asyncio.create_task(memory_manager.extract_and_store_async(messages))
 
@@ -221,6 +236,7 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
         "status": "completed",
         "thread_id": config["configurable"]["thread_id"],
         "response": final_text,
+        "tool_traces": tool_traces,
     }
 
 

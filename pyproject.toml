@@ -16,5 +16,7 @@ dependencies = [
     "psycopg[binary]>=3.3.6",
     "pymilvus>=3.0.2",
     "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+    "streamlit>=1.66.1",
     "uvicorn>=0.54.0",
 ]
