@@ -110,3 +110,56 @@ class SecondBrainStore:
 
         scored_results.sort(key=lambda x: x["score"], reverse=True)
         return scored_results[:top_k]
+
+    def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate normalized 768-dim embeddings for a batch of texts in a single API call."""
+        response = self.genai_client.models.embed_content(
+            model=self.embedding_model,
+            contents=texts,
+            config=types.EmbedContentConfig(output_dimensionality=self.dim),
+        )
+        vectors = []
+        for emb in response.embeddings:
+            vec = np.array(emb.values, dtype=np.float32)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            vectors.append(vec.tolist())
+        return vectors
+
+    def delete_by_source(self, source_file: str):
+        """Remove existing chunks of a file before re-indexing updated content."""
+        self.client.delete(
+            collection_name=self.collection_name,
+            filter=f'source_file == "{source_file}"',
+        )
+
+    def add_documents_batch(
+        self, chunks: List[str], source_file: str, doc_type: str = "pdf"
+    ) -> int:
+        """Batch embed and insert multiple text chunks into Milvus."""
+        if not chunks:
+            return 0
+
+        # Process in batches of 50 chunks per API request to respect rate limits
+        batch_size = 50
+        total_inserted = 0
+        now_ts = int(datetime.now().timestamp())
+
+        for i in range(0, len(chunks), batch_size):
+            batch_texts = chunks[i : i + batch_size]
+            vectors = self._get_embeddings_batch(batch_texts)
+            data = [
+                {
+                    "text": text,
+                    "dense_vector": vec,
+                    "doc_type": doc_type,
+                    "source_file": source_file,
+                    "created_ts": now_ts,
+                }
+                for text, vec in zip(batch_texts, vectors)
+            ]
+            res = self.client.insert(collection_name=self.collection_name, data=data)
+            total_inserted += res["insert_count"]
+
+        return total_inserted

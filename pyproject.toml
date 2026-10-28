@@ -15,6 +15,7 @@ dependencies = [
     "mcp[cli]>=1.30.0",
     "psycopg[binary]>=3.3.6",
     "pymilvus>=3.0.2",
+    "pymupdf>=2.0",
     "python-dotenv>=1.2.4",
     "requests>=2.34.2",
     "streamlit>=1.66.1",

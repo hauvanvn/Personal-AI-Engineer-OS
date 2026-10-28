@@ -1,0 +1,7 @@
+{
+  "total_test_cases": 4,
+  "rag_hit_rate_at_3_pct": 50.0,
+  "mcp_tool_selection_accuracy_pct": 100.0,
+  "avg_faithfulness_score_pct": 75.0,
+  "avg_end_to_end_latency_sec": 3.66
+}
