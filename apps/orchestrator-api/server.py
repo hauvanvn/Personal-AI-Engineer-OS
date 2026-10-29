@@ -1,12 +1,14 @@
 import asyncio
 import os
+import sys
+import re
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, TypedDict, List, Literal, Optional, Dict, Any
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,10 +26,16 @@ from memory_store import LongTermMemoryManager, extract_clean_text
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
+# Import DocumentIngestionWorker for background file uploads
+sys.path.append(str(ROOT_DIR / "apps" / "background-worker"))
+from ingest_worker import DocumentIngestionWorker, KNOWLEDGE_DIR  # noqa: E402
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_URI = os.getenv(
     "POSTGRES_URI", "postgresql://admin:secretpassword@localhost:5432/PaPa_db"
 )
+
+ALLOWED_EXTENSIONS = {".pdf", ".md", ".txt"}
 
 SENSITIVE_MUTATE_TOOLS = {
     "create_personal_task",
@@ -47,14 +55,46 @@ You have access to two specialized subsystems:
 {user_profile}
 ==============================
 
-Guidelines:
+Citation and Grounding Rules:
+- Whenever you answer using information from `search_knowledge`, you MUST include inline citations at the end of relevant sentences in the exact format:.
+- At the end of your response, include a "References:" section listing the cited source files.
 - Personalize your technical responses using the User Long-Term Profile above.
-- Always cite `source_file` and `score` when retrieving from the Second Brain.
 """
 
 # ==========================================
 # FASTAPI LIFESPAN & GRAPH INITIALIZATION
 # ==========================================
+
+def _parse_citations_from_tool_output(output_text: str) -> List[Dict[str, Any]]:
+    """Parse structured source citations from search_knowledge tool output."""
+    citations = []
+    if not output_text or "No relevant documents found" in output_text:
+        return citations
+
+    blocks = output_text.split("\n\n---\n\n")
+    pattern = re.compile(
+        r"\[\d+\]\s*Source:\s*(?P<source>[^\s(]+)\s*\(Type:\s*(?P<doc_type>[^|]+)\|\s*Score:\s*(?P<score>[\d.]+)\)\s*\nContent:\s*(?P<content>.*)",
+        re.DOTALL,
+    )
+
+    for block in blocks:
+        match = pattern.search(block.strip())
+        if match:
+            content = match.group("content").strip()
+            page_match = re.match(r"^\[Page\s+(\d+)\]\s*(.*)", content, re.DOTALL)
+            page_num = int(page_match.group(1)) if page_match else None
+            clean_snippet = page_match.group(2).strip() if page_match else content
+
+            citations.append(
+                {
+                    "source_file": match.group("source").strip(),
+                    "doc_type": match.group("doc_type").strip(),
+                    "score": float(match.group("score")),
+                    "page": page_num,
+                    "snippet": clean_snippet,
+                }
+            )
+    return citations
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -80,6 +120,7 @@ async def lifespan(app: FastAPI):
     )
 
     memory_manager = LongTermMemoryManager(db_uri=DB_URI, api_key=GEMINI_API_KEY)
+    ingestion_worker = DocumentIngestionWorker()
 
     async with AsyncExitStack() as stack:
         rag_session = await stack.enter_async_context(mcp_client.session("second_brain"))
@@ -170,6 +211,7 @@ async def lifespan(app: FastAPI):
 
         app.state.graph = builder.compile(checkpointer=checkpointer)
         app.state.memory_manager = memory_manager
+        app.state.ingestion_worker = ingestion_worker
         print(
             f"[*] FastAPI Orchestrator ready with {len(all_mcp_tools)} MCP tools."
         )
@@ -204,19 +246,24 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
     state = await graph.aget_state(config)
     messages = state.values.get("messages", [])
 
-    # Extract recent tool executions from the current turn to visualize on the UI
     tool_traces = []
+    citations = []
     for m in reversed(messages):
         if m.type == "human":
             break
         if m.type == "tool":
+            clean_out = extract_clean_text(m.content)
             tool_traces.append(
                 {
                     "tool_name": m.name,
-                    "output": extract_clean_text(m.content),
+                    "output": clean_out,
                 }
             )
+            if m.name == "search_knowledge":
+                citations.extend(_parse_citations_from_tool_output(clean_out))
+
     tool_traces.reverse()
+    citations.reverse()
 
     if state.next and "safety_gatekeeper" in state.next:
         interrupt_val = state.tasks[0].interrupts[0].value
@@ -225,6 +272,7 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
             "thread_id": config["configurable"]["thread_id"],
             "pending_approval": interrupt_val,
             "tool_traces": tool_traces,
+            "citations": citations,
         }
 
     final_text = extract_clean_text(messages[-1].content) if messages else ""
@@ -237,6 +285,7 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
         "thread_id": config["configurable"]["thread_id"],
         "response": final_text,
         "tool_traces": tool_traces,
+        "citations": citations,
     }
 
 
@@ -276,6 +325,47 @@ async def get_memories():
     return {
         "user_profile": app.state.memory_manager.get_user_profile_context(limit=50)
     }
+
+@app.post("/knowledge/upload", status_code=202)
+async def upload_knowledge_documents(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+):
+    """Save uploaded documents to knowledge_base/ and queue background ingestion."""
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    worker: DocumentIngestionWorker = app.state.ingestion_worker
+    queued_files = []
+
+    for upload in files:
+        filename = Path(upload.filename).name
+        suffix = Path(filename).suffix.lower()
+        if suffix not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file extension '{suffix}' for '{filename}'. Allowed: .pdf, .md, .txt",
+            )
+
+        dest_path = KNOWLEDGE_DIR / filename
+        content = await upload.read()
+        dest_path.write_bytes(content)
+
+        doc_type = "pdf" if suffix == ".pdf" else "architecture"
+        worker.mark_status(filename, status="processing", doc_type=doc_type)
+        background_tasks.add_task(worker.ingest_single_file, dest_path)
+        queued_files.append(filename)
+
+    return {
+        "status": "accepted",
+        "message": f"Queued {len(queued_files)} file(s) for background ingestion.",
+        "files": queued_files,
+    }
+
+
+@app.get("/knowledge/documents")
+async def list_knowledge_documents():
+    """Return all documents in document_registry and their ingestion status."""
+    worker: DocumentIngestionWorker = app.state.ingestion_worker
+    return {"documents": worker.list_registered_documents()}
 
 
 if __name__ == "__main__":
