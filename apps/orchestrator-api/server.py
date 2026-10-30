@@ -55,9 +55,13 @@ You have access to two specialized subsystems:
 {user_profile}
 ==============================
 
-Citation and Grounding Rules:
-- Whenever you answer using information from `search_knowledge`, you MUST include inline citations at the end of relevant sentences in the exact format:.
-- At the end of your response, include a "References:" section listing the cited source files.
+KNOWLEDGE-FIRST RETRIEVAL & FALLBACK RULES:
+1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or local git status commands), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering.
+2. Grounded Answer (When Found in Knowledge Base): If `search_knowledge` returns relevant context that answers the user's question, prioritize that information and cite the exact source file inline using the format: `` (for example: ``).
+3. General Knowledge Fallback (When Not Found in Knowledge Base): If `search_knowledge` returns no relevant results, or if the retrieved chunks do not contain the answer to the user's question, answer normally using your own general technical knowledge. When answering from general knowledge, explicitly state a brief note at the beginning (e.g., "Note: This topic was not found in your knowledge base. Answering from general knowledge:") and DO NOT include any `` tags.
+4. Keep your responses concise, structured, and technical. Never fabricate source filenames.
+
+Grounding Rules:
 - Personalize your technical responses using the User Long-Term Profile above.
 """
 
@@ -68,12 +72,16 @@ Citation and Grounding Rules:
 def _parse_citations_from_tool_output(output_text: str) -> List[Dict[str, Any]]:
     """Parse structured source citations from search_knowledge tool output."""
     citations = []
-    if not output_text or "No relevant documents found" in output_text:
+    if (
+        not output_text
+        or "No relevant documents found" in output_text
+        or "No query matched in Second Brain." in output_text
+    ):
         return citations
 
     blocks = output_text.split("\n\n---\n\n")
     pattern = re.compile(
-        r"\[\d+\]\s*Source:\s*(?P<source>[^\s(]+)\s*\(Type:\s*(?P<doc_type>[^|]+)\|\s*Score:\s*(?P<score>[\d.]+)\)\s*\nContent:\s*(?P<content>.*)",
+        r"\[\d+\]\s*Source:\s*(?P<source>[^\s(]+)\s*\(Type:\s*(?P<doc_type>[^|)]+?)(?:\s*\|\s*|\s+)Score:\s*(?P<score>[\d.]+)\)\s*\n(?:Content|Text):\s*(?P<content>.*)",
         re.DOTALL,
     )
 
@@ -276,6 +284,9 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
         }
 
     final_text = extract_clean_text(messages[-1].content) if messages else ""
+
+    if "not found in your knowledge base" in final_text.lower():
+        citations = []
 
     if messages:
         asyncio.create_task(memory_manager.extract_and_store_async(messages))

@@ -77,36 +77,69 @@ class SecondBrainStore:
         res = self.client.insert(collection_name=self.collection_name, data=data)
         return res["insert_count"]
 
-    def search_with_time_decay(self, query: str, doc_type: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_with_time_decay(
+        self,
+        query: str,
+        top_k: int = 4,
+        doc_type: Optional[str] = None,
+        decay_rate: float = 0.01,
+        min_score: float = 0.50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Execute semantic search and rerank results by combining Cosine Similarity (85%)
+        with an exponential Time-Decay score (15%), filtering out chunks below min_score.
+        """
         query_vector = self._get_embedding(query)
 
         filter_expr = f'doc_type == "{doc_type}"' if doc_type else ""
+        candidate_limit = max(top_k * 3, 15)
 
-        results = self.client.search(
+        search_results = self.client.search(
             collection_name=self.collection_name,
             data=[query_vector],
             filter=filter_expr,
-            limit=top_k * 2,
-            output_fields=["text", "source_file", "doc_type", "created_ts"]
-        )[0]
+            limit=candidate_limit,
+            output_fields=[
+                "text",
+                "source_file",
+                "doc_type",
+                "page",
+                "created_at",
+            ],
+            search_params={"metric_type": "COSINE", "params": {"ef": 64}},
+        )
+
+        if not search_results or not search_results[0]:
+            return []
 
         now_ts = datetime.now().timestamp()
-        scored_results = []
+        scored_results: List[Dict[str, Any]] = []
 
-        for hit in results:
-            entity = hit["entity"]
-            semantic_score = hit["distance"] # Cosine similarity
+        for hit in search_results[0]:
+            entity = hit.get("entity", {})
+            semantic_score = float(hit.get("distance", 0.0))
 
-            age_days = max(0, (now_ts - entity.get("created_ts", now_ts)) / 86400)
-            recency_score = 1.0 / (1.0 + 0.01 * age_days)
+            created_at = int(entity.get("created_at", now_ts))
+            age_hours = max(0.0, (now_ts - created_at) / 3600.0)
+            recency_score = np.exp(-decay_rate * age_hours)
 
-            final_score = 0.85 * semantic_score + 0.15 * recency_score
-            scored_results.append({
-                "score": round(final_score, 4),
-                "text": entity["text"],
-                "source_file": entity["source_file"],
-                "doc_type": entity["doc_type"]
-            })
+            final_score = (0.85 * semantic_score) + (0.15 * recency_score)
+
+            if final_score < min_score:
+                continue
+
+            scored_results.append(
+                {
+                    "id": hit.get("id"),
+                    "text": entity.get("text", ""),
+                    "source_file": entity.get("source_file", "unknown"),
+                    "doc_type": entity.get("doc_type", "document"),
+                    "page": entity.get("page", 1),
+                    "semantic_score": round(semantic_score, 4),
+                    "recency_score": round(recency_score, 4),
+                    "score": round(final_score, 4),
+                }
+            )
 
         scored_results.sort(key=lambda x: x["score"], reverse=True)
         return scored_results[:top_k]

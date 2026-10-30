@@ -11,13 +11,20 @@ store = SecondBrainStore()
 def search_knowledge(
     query: str = Field(..., description="Query for document, slide or personal note"),
     doc_type: Optional[str] = Field(None, description="Filter type: 'note', 'slide', 'pdf', 'architecture'"),
-    top_k: int = Field(4, description="Number of return results")
+    top_k: int = Field(4, description="Number of return results"),
+    min_score: float = Field(0.50, description="Minimum relevance score threshold (0.0 to 1.0)")
 ) -> str:
     """
-    Query from Second Brain of user \n
-    Alway call when user ask about old project, saved data,...
+    Primary lookup tool to query the user's Second Brain knowledge base.
+    ALWAYS call this tool FIRST for any informational, technical, architectural, project, or document-related question.
+    If this returns 'No query matched in Second Brain.', fallback to answering with your general knowledge.
     """
-    results = store.search_with_time_decay(query=query, doc_type=doc_type, top_k=top_k)
+    results = store.search_with_time_decay(
+        query=query,
+        doc_type=doc_type,
+        top_k=top_k,
+        min_score=min_score
+    )
     if not results:
         return "No query matched in Second Brain."
 
