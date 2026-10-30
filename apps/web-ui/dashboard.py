@@ -145,6 +145,7 @@ with st.sidebar:
         """
         - **`second-brain-rag`** *(Milvus Hybrid + Time-Decay)*
         - **`dev-life-workspace`** *(Postgres Tasks + Local Git)*
+        - **`web-search`** *(Tavily Web Search Fallback)*
         """
     )
 
@@ -174,17 +175,31 @@ for msg in st.session_state.chat_history:
 
         st.markdown(msg["content"])
 
-        # Render structured source citations when retrieved from Second Brain
+        # Render structured source citations (Knowledge Base + Web Search)
         if msg.get("citations"):
-            st.markdown("**Cited Knowledge Sources:**")
-            for idx, cit in enumerate(msg["citations"], 1):
-                page_label = f" | Page {cit['page']}" if cit.get("page") else ""
-                header = (
-                    f"[{idx}] {cit['source_file']} "
-                    f"(Type: {cit['doc_type']}{page_label} | Score: {cit['score']})"
-                )
-                with st.expander(header, expanded=False):
-                    st.text(cit["snippet"])
+            kb_citations = [c for c in msg["citations"] if c.get("source_file")]
+            web_citations = [c for c in msg["citations"] if c.get("source_type") == "web"]
+
+            if kb_citations:
+                st.markdown("**Cited Knowledge Sources:**")
+                for idx, cit in enumerate(kb_citations, 1):
+                    page_label = f" | Page {cit['page']}" if cit.get("page") else ""
+                    header = (
+                        f"[{idx}] {cit['source_file']} "
+                        f"(Type: {cit['doc_type']}{page_label} | Score: {cit['score']})"
+                    )
+                    with st.expander(header, expanded=False):
+                        st.text(cit["snippet"])
+
+            if web_citations:
+                st.markdown("**Web Search Results:**")
+                for idx, cit in enumerate(web_citations, 1):
+                    header = (
+                        f"[{idx}] {cit['title']} (Score: {cit['score']:.2f})"
+                    )
+                    with st.expander(header, expanded=False):
+                        st.markdown(f"[{cit['url']}]({cit['url']})")
+                        st.text(cit["snippet"])
 
         if msg.get("latency"):
             st.caption(f"Latency: {msg['latency']}s")

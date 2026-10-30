@@ -20,5 +20,6 @@ dependencies = [
     "python-multipart>=0.0.32",
     "requests>=2.34.2",
     "streamlit>=1.66.1",
+    "tavily-python>=0.5.0",
     "uvicorn>=0.54.0",
 ]

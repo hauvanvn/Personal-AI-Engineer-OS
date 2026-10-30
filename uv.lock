@@ -1674,6 +1674,7 @@ dependencies = [
     { name = "python-multipart" },
     { name = "requests" },
     { name = "streamlit" },
+    { name = "tavily-python" },
     { name = "uvicorn" },
 ]
 
@@ -1694,6 +1695,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "streamlit", specifier = ">=1.66.1" },
+    { name = "tavily-python", specifier = ">=0.5.0" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 
@@ -2774,6 +2776,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/58/8c37dea7bbf769b20d58e7ace7e5edfe65b849442b00ffcdd56be88697c6/tabulate-0.10.0.tar.gz", hash = "sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d", size = 91754, upload-time = "2026-03-04T18:55:34.402Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3", size = 39814, upload-time = "2026-03-04T18:55:31.284Z" },
+]
+
+[[package]]
+name = "tavily-python"
+version = "0.8.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "requests" },
+    { name = "tiktoken" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2f/39/3aff85cb3b45cab3ef9578560364b893baa34e79744e99567a825dbadf57/tavily_python-0.8.5.tar.gz", hash = "sha256:1795965c3ffe5654856244d637daa816a4ee947aca57d0588b731c69e75e71fe", size = 35634, upload-time = "2026-10-06T15:11:34.827Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/c5/fc13567e2a1d3671f51252d44f580bf3ab3c0a6ec90a6553f5c67ba87208/tavily_python-0.8.5-py3-none-any.whl", hash = "sha256:f8d2880f5aa67cf3ee2eb1f7c9336ea50dc331eb1e406688391badb0140599a7", size = 24629, upload-time = "2026-10-06T15:11:33.854Z" },
 ]
 
 [[package]]
