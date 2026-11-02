@@ -83,6 +83,38 @@ class LongTermMemoryManager:
 
         return "\n".join([f"- [{r[0].upper()}] {r[1]}" for r in rows])
 
+    def get_all_memories(self, limit: int = 50) -> list:
+        """Return all memory rows with id, category, fact_content, and updated_at."""
+        with psycopg.connect(self.db_uri) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, category, fact_content, "
+                    "TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI:SS') "
+                    "FROM user_memories ORDER BY updated_at DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "category": r[1],
+                "fact": r[2],
+                "updated_at": r[3],
+            }
+            for r in rows
+        ]
+
+    def delete_memory(self, memory_id: int) -> bool:
+        """Delete a specific memory row by its primary key. Returns True if deleted."""
+        with psycopg.connect(self.db_uri) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM user_memories WHERE id = %s", (memory_id,)
+                )
+                deleted = cur.rowcount > 0
+            conn.commit()
+        return deleted
+
     async def extract_and_store_async(self, all_messages: List[BaseMessage]):
         """Run asynchronously in the background to extract new facts across tool-calling turns."""
         try:

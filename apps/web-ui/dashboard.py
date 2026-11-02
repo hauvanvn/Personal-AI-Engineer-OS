@@ -37,6 +37,39 @@ def fetch_long_term_memories() -> str:
     return "Failed to load memories."
 
 
+def fetch_long_term_memories_list() -> List[Dict[str, Any]]:
+    """Return structured list of memory entries with id, fact, category, updated_at."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/memories", timeout=5)
+        if res.status_code == 200:
+            return res.json().get("memories", [])
+    except Exception:
+        return []
+    return []
+
+
+def delete_knowledge_document(filename: str) -> bool:
+    """Call DELETE endpoint to remove a knowledge document."""
+    try:
+        res = requests.delete(
+            f"{API_BASE_URL}/knowledge/documents/{filename}", timeout=10
+        )
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
+def delete_memory_entry(memory_id: int) -> bool:
+    """Call DELETE endpoint to remove a long-term memory entry."""
+    try:
+        res = requests.delete(
+            f"{API_BASE_URL}/memories/{memory_id}", timeout=10
+        )
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
 def fetch_knowledge_documents() -> List[Dict[str, Any]]:
     try:
         res = requests.get(f"{API_BASE_URL}/knowledge/documents", timeout=5)
@@ -119,10 +152,22 @@ with st.sidebar:
     if docs:
         with st.expander(f"Indexed Documents ({len(docs)})", expanded=False):
             for d in docs:
-                st.markdown(
-                    f"**{d['source_file']}**  \n"
-                    f"Status: `{d['status']}` | Chunks: `{d['chunk_count']}`"
-                )
+                doc_col, del_col = st.columns([5, 1], vertical_alignment="center")
+                with doc_col:
+                    st.markdown(
+                        f"**{d['source_file']}**  \n"
+                        f"Status: `{d['status']}` | Chunks: `{d['chunk_count']}`"
+                    )
+                with del_col:
+                    if st.button(
+                        "Delete",
+                        key=f"del_doc_{d['source_file']}",
+                        use_container_width=True,
+                    ):
+                        if delete_knowledge_document(d["source_file"]):
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to delete {d['source_file']}")
     else:
         st.caption("No documents indexed yet.")
 
@@ -134,8 +179,27 @@ with st.sidebar:
     if st.button("Refresh Profile", use_container_width=True):
         st.rerun()
 
-    memory_text = fetch_long_term_memories()
-    st.code(memory_text, language="markdown")
+    memories = fetch_long_term_memories_list()
+    if memories:
+        for mem in memories:
+            mem_col, del_col = st.columns([5, 1], vertical_alignment="center")
+            with mem_col:
+                st.markdown(
+                    f"- [{mem.get('category', '').upper()}] {mem.get('fact', '')}"
+                )
+            with del_col:
+                if st.button(
+                    "Delete",
+                    key=f"del_mem_{mem['id']}",
+                    use_container_width=True,
+                ):
+                    if delete_memory_entry(mem["id"]):
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete memory.")
+    else:
+        memory_text = fetch_long_term_memories()
+        st.code(memory_text, language="markdown")
 
     st.divider()
 

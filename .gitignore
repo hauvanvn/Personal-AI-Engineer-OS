@@ -15,3 +15,6 @@ knowledge_base/
 
 # Enviroment configuation
 .env
+
+# Coding Agent
+AGENT_RULES.md

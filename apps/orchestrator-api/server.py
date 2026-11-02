@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Annotated, TypedDict, List, Literal, Optional, Dict, Any
 from dotenv import load_dotenv
 
+import psycopg
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -429,7 +430,57 @@ async def resume_endpoint(req: ResumeRequest):
 @app.get("/memories")
 async def get_memories():
     return {
-        "user_profile": app.state.memory_manager.get_user_profile_context(limit=50)
+        "user_profile": app.state.memory_manager.get_user_profile_context(limit=50),
+        "memories": app.state.memory_manager.get_all_memories(limit=50),
+    }
+
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory(memory_id: int):
+    """Delete a specific long-term memory entry by its ID."""
+    deleted = app.state.memory_manager.delete_memory(memory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Memory with id={memory_id} not found.")
+    return {"status": "deleted", "memory_id": memory_id}
+
+
+@app.delete("/knowledge/documents/{filename:path}")
+async def delete_knowledge_document(filename: str):
+    """Delete a knowledge document: remove vectors from Milvus, registry row from PostgreSQL, and physical file."""
+    worker: DocumentIngestionWorker = app.state.ingestion_worker
+
+    # (a) Delete vectors in Milvus
+    worker.store.delete_by_source(filename)
+
+    # (b) Delete registry record from PostgreSQL
+    with psycopg.connect(DB_URI) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM document_registry WHERE source_file = %s",
+                (filename,),
+            )
+            db_deleted = cur.rowcount > 0
+        conn.commit()
+
+    # (c) Remove the physical file if it exists
+    file_path = KNOWLEDGE_DIR / filename
+    file_removed = False
+    if file_path.exists():
+        file_path.unlink()
+        file_removed = True
+
+    if not db_deleted and not file_removed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document '{filename}' not found in registry or on disk.",
+        )
+
+    return {
+        "status": "deleted",
+        "filename": filename,
+        "milvus_cleared": True,
+        "db_deleted": db_deleted,
+        "file_removed": file_removed,
     }
 
 @app.post("/knowledge/upload", status_code=202)
