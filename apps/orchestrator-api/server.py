@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import sys
 import re
@@ -507,13 +508,27 @@ async def upload_knowledge_documents(
         dest_path.write_bytes(content)
 
         doc_type = "pdf" if suffix == ".pdf" else "architecture"
-        worker.mark_status(filename, status="processing", doc_type=doc_type)
+        file_hash = hashlib.sha256(content).hexdigest()
+        if worker.is_file_unchanged(filename, file_hash):
+            worker.mark_status(
+                filename,
+                status="skipped_unchanged",
+                file_hash=file_hash,
+                doc_type=doc_type,
+            )
+            continue
+
+        worker.mark_status(filename, status="processing", file_hash=file_hash, doc_type=doc_type)
         background_tasks.add_task(worker.ingest_single_file, dest_path)
         queued_files.append(filename)
 
     return {
         "status": "accepted",
-        "message": f"Queued {len(queued_files)} file(s) for background ingestion.",
+        "message": (
+            f"Queued {len(queued_files)} file(s) for background ingestion."
+            if queued_files
+            else "Uploaded file(s) are already indexed and unchanged (skipped)."
+        ),
         "files": queued_files,
     }
 

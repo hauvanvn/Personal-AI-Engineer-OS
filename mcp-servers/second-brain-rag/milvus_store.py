@@ -5,8 +5,21 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pathlib import Path
+import logging
 import os
+import re
+import sys
+import time
 import numpy as np
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.INFO)
+    _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    _handler.setFormatter(_formatter)
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -23,7 +36,6 @@ class SecondBrainStore:
 
         self.client = MilvusClient(uri=uri, token=token)
         self.collection_name = "personal_knowledge_v2"
-        self.dim = 768 
         self._init_collection()
 
     def _init_collection(self):
@@ -52,18 +64,60 @@ class SecondBrainStore:
             index_params=index_params
         )
 
+    @staticmethod
+    def _is_rate_limit_error(exc: Exception) -> bool:
+        """Check whether the exception indicates a Gemini API rate-limit / quota error."""
+        msg = str(exc).lower()
+        return "429" in msg or "resource_exhausted" in msg or "quota" in msg
+
+    @staticmethod
+    def _parse_retry_delay(exc: Exception) -> Optional[float]:
+        """Try to extract a suggested retry delay (seconds) from the error message."""
+        pattern = r"retry in ([\d\.]+)s|retryDelay['\"]?\s*:\s*['\"]?(\d+)s"
+        match = re.search(pattern, str(exc), re.IGNORECASE)
+        if match:
+            raw = match.group(1) or match.group(2)
+            return float(raw)
+        return None
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Conservatively estimate token count for a text string.
+
+        Vietnamese Unicode and mixed code/text average roughly 1.8-2.2 chars
+        per Gemini token. We use 1.8 (the lower bound) plus a small overhead
+        to stay on the safe side.
+        """
+        return max(1, int(len(text) / 1.8) + 15)
+
     def _get_embedding(self, text: str) -> List[float]:
-        """Call the Gemini Embedding API for free to obtain a 768-dimensional vector"""
-        response = self.genai_client.models.embed_content(
-            model=self.embedding_model,
-            contents=text,
-            config=types.EmbedContentConfig(
-                output_dimensionality=self.dim
-            )
-        )
-        vec = np.array(response.embeddings[0].values)
-        norm_vec = vec / np.linalg.norm(vec)
-        return norm_vec.tolist()
+        """Call the Gemini Embedding API for free to obtain a 768-dimensional vector.
+
+        Includes retry with exponential backoff for rate-limit (429) errors.
+        """
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self.genai_client.models.embed_content(
+                    model=self.embedding_model,
+                    contents=text,
+                    config=types.EmbedContentConfig(
+                        output_dimensionality=self.dim
+                    )
+                )
+                vec = np.array(response.embeddings[0].values)
+                norm_vec = vec / np.linalg.norm(vec)
+                return norm_vec.tolist()
+            except Exception as e:
+                if self._is_rate_limit_error(e) and attempt < max_retries - 1:
+                    wait_time = min(15 * (2 ** attempt), 90)
+                    logger.warning(
+                        "Rate limit hit in _get_embedding (attempt %d/%d). "
+                        "Waiting %.1f seconds before retry.",
+                        attempt + 1, max_retries, wait_time,
+                    )
+                    time.sleep(wait_time)
+                else:
+                    raise
 
     def add_document(self, text: str, source_file: str, doc_type: str = "note") -> int:
         vector = self._get_embedding(text)
@@ -144,21 +198,161 @@ class SecondBrainStore:
         scored_results.sort(key=lambda x: x["score"], reverse=True)
         return scored_results[:top_k]
 
-    def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
-        """Generate normalized 768-dim embeddings for a batch of texts in a single API call."""
-        response = self.genai_client.models.embed_content(
-            model=self.embedding_model,
-            contents=texts,
-            config=types.EmbedContentConfig(output_dimensionality=self.dim),
-        )
-        vectors = []
-        for emb in response.embeddings:
-            vec = np.array(emb.values, dtype=np.float32)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
-            vectors.append(vec.tolist())
-        return vectors
+    def _get_embeddings_batch(
+        self,
+        texts: List[str],
+        batch_size: int = 10,
+        max_batch_tokens: int = 6000,
+    ) -> List[List[float]]:
+        """Generate normalized 768-dim embeddings with token-aware batching.
+
+        Dynamically groups texts into sub-batches bounded by both item count
+        (batch_size, default 10) and estimated token budget
+        (max_batch_tokens, default 6000). A 60-second rolling window
+        throttles total tokens sent to stay safely under the Free Tier
+        30,000 TPM limit (budget: 22,000 estimated tokens per window).
+
+        Each sub-batch is retried independently on 429 / RESOURCE_EXHAUSTED
+        errors so that large PDF ingestions survive rate limits without
+        losing progress.
+        """
+        if not texts:
+            return []
+
+        # -- 1. Build token-aware sub-batches --------------------------------
+        max_single_chunk_chars = 12000  # hard cap so one chunk never blows TPM
+        sub_batches: List[List[str]] = []
+        current_batch: List[str] = []
+        current_tokens = 0
+
+        for raw_text in texts:
+            text = (
+                raw_text[:max_single_chunk_chars]
+                if len(raw_text) > max_single_chunk_chars
+                else raw_text
+            )
+            t_tokens = self._estimate_tokens(text)
+
+            # If a single chunk already exceeds the token budget, isolate it
+            if t_tokens >= max_batch_tokens:
+                if current_batch:
+                    sub_batches.append(current_batch)
+                    current_batch = []
+                    current_tokens = 0
+                sub_batches.append([text])
+                continue
+
+            # Adding this chunk would exceed either limit -> flush
+            if (
+                len(current_batch) >= batch_size
+                or current_tokens + t_tokens > max_batch_tokens
+            ):
+                if current_batch:
+                    sub_batches.append(current_batch)
+                current_batch = [text]
+                current_tokens = t_tokens
+            else:
+                current_batch.append(text)
+                current_tokens += t_tokens
+
+        if current_batch:
+            sub_batches.append(current_batch)
+
+        total_batches = len(sub_batches)
+        total_chunks = len(texts)
+
+        # -- 2. Rolling TPM window state -------------------------------------
+        tpm_budget = 30000
+        tokens_used_in_window = 0
+        window_start_time = time.time()
+
+        # -- 3. Process each sub-batch with retry ----------------------------
+        max_retries = 8
+        all_vectors: List[List[float]] = []
+        processed_chunks = 0
+
+        for batch_idx, sub_batch in enumerate(sub_batches):
+            sub_batch_tokens = sum(self._estimate_tokens(t) for t in sub_batch)
+
+            # Reset rolling window if 62 seconds have naturally elapsed
+            elapsed_in_window = time.time() - window_start_time
+            if elapsed_in_window >= 62.0:
+                tokens_used_in_window = 0
+                window_start_time = time.time()
+                elapsed_in_window = 0.0
+
+            # Proactive TPM throttle: if adding this batch would exceed the
+            # safe budget, wait for the current 60-second window to expire.
+            if tokens_used_in_window + sub_batch_tokens > tpm_budget:
+                sleep_time = max(5.0, 62.0 - (time.time() - window_start_time))
+                logger.info(
+                    f"TPM budget reached ({tokens_used_in_window} tokens). "
+                    f"Pausing {sleep_time:.1f}s for quota window reset..."
+                )
+                time.sleep(sleep_time)
+                tokens_used_in_window = 0
+                window_start_time = time.time()
+
+            for attempt in range(max_retries):
+                try:
+                    response = self.genai_client.models.embed_content(
+                        model=self.embedding_model,
+                        contents=sub_batch,
+                        config=types.EmbedContentConfig(
+                            output_dimensionality=self.dim
+                        ),
+                    )
+                    for emb in response.embeddings:
+                        vec = np.array(emb.values, dtype=np.float32)
+                        norm = np.linalg.norm(vec)
+                        if norm > 0:
+                            vec = vec / norm
+                        all_vectors.append(vec.tolist())
+
+                    # Track tokens and log progress
+                    tokens_used_in_window += sub_batch_tokens
+                    processed_chunks += len(sub_batch)
+                    idx = batch_idx + 1
+                    logger.info(
+                        f"Embedded sub-batch {idx}/{total_batches} "
+                        f"({processed_chunks}/{total_chunks} chunks)"
+                    )
+                    break  # success - move to next sub-batch
+                except Exception as e:
+                    err_msg = str(e)
+                    is_rate_limit = (
+                        "429" in err_msg
+                        or "resource_exhausted" in err_msg.lower()
+                        or "quota" in err_msg.lower()
+                    )
+                    if is_rate_limit and attempt < max_retries - 1:
+                        match = re.search(
+                            r"retry in ([\d\.]+)s|retryDelay['\"]?\s*:\s*['\"]?(\d+)s",
+                            err_msg,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            parsed_seconds = float(match.group(1) or match.group(2))
+                            wait_time = parsed_seconds + 6.0
+                        else:
+                            wait_time = 65.0
+
+                        logger.warning(
+                            f"Rate limit hit on sub-batch {batch_idx + 1}/{total_batches} "
+                            f"(attempt {attempt + 1}/{max_retries}). "
+                            f"Waiting {wait_time:.1f}s before retry."
+                        )
+                        time.sleep(wait_time)
+                        tokens_used_in_window = 0
+                        window_start_time = time.time()
+                    else:
+                        raise
+
+            # Brief pause between sub-batches to spread requests
+            if batch_idx < total_batches - 1:
+                time.sleep(2.0)
+
+        return all_vectors
 
     def delete_by_source(self, source_file: str):
         """Remove existing chunks of a file before re-indexing updated content."""
@@ -167,21 +361,44 @@ class SecondBrainStore:
             filter=f'source_file == "{source_file}"',
         )
 
+    def count_by_source(self, source_file: str) -> int:
+        """Return the count of vector chunks currently stored in Milvus for source_file."""
+        try:
+            res = self.client.query(
+                collection_name=self.collection_name,
+                filter=f'source_file == "{source_file}"',
+                output_fields=["count(*)"],
+            )
+            if res and isinstance(res, list) and "count(*)" in res[0]:
+                return int(res[0]["count(*)"])
+            return 0
+        except Exception as e:
+            logger.warning("Failed to query chunk count for '%s': %s", source_file, e)
+            return 0
+
     def add_documents_batch(
         self, chunks: List[str], source_file: str, doc_type: str = "pdf"
     ) -> int:
-        """Batch embed and insert multiple text chunks into Milvus."""
+        """Batch embed and insert multiple text chunks into Milvus.
+
+        Embeddings are generated via token-aware sub-batches (max 10 items /
+        6000 tokens per API call) with TPM throttling.  Milvus inserts are
+        performed in safe chunks of up to 200 rows per call.
+        """
         if not chunks:
             return 0
 
-        # Process in batches of 50 chunks per API request to respect rate limits
-        batch_size = 50
+        vectors = self._get_embeddings_batch(
+            chunks, batch_size=10, max_batch_tokens=6000
+        )
+
         total_inserted = 0
         now_ts = int(datetime.now().timestamp())
+        milvus_insert_size = 200
 
-        for i in range(0, len(chunks), batch_size):
-            batch_texts = chunks[i : i + batch_size]
-            vectors = self._get_embeddings_batch(batch_texts)
+        for i in range(0, len(chunks), milvus_insert_size):
+            batch_texts = chunks[i : i + milvus_insert_size]
+            batch_vecs = vectors[i : i + milvus_insert_size]
             data = [
                 {
                     "text": text,
@@ -190,7 +407,7 @@ class SecondBrainStore:
                     "source_file": source_file,
                     "created_ts": now_ts,
                 }
-                for text, vec in zip(batch_texts, vectors)
+                for text, vec in zip(batch_texts, batch_vecs)
             ]
             res = self.client.insert(collection_name=self.collection_name, data=data)
             total_inserted += res["insert_count"]

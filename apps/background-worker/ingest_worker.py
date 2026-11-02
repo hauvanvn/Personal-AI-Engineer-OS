@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import sys
 import time
@@ -7,6 +8,15 @@ from typing import List, Dict, Any
 import pymupdf
 import psycopg
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setLevel(logging.INFO)
+    _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    _handler.setFormatter(_formatter)
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -62,15 +72,29 @@ class DocumentIngestionWorker:
         with psycopg.connect(self.db_uri) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT file_hash, status FROM document_registry WHERE source_file = %s",
+                    "SELECT file_hash, status, chunk_count FROM document_registry WHERE source_file = %s",
                     (source_file,),
                 )
                 row = cur.fetchone()
-                return bool(
-                    row
-                    and row[0] == current_hash
-                    and row[1] in ("indexed", "skipped_unchanged")
-                )
+                if not row or row[0] != current_hash:
+                    return False
+
+                # If status is indexed or skipped_unchanged, verify chunks exist in Milvus
+                if row[1] in ("indexed", "skipped_unchanged"):
+                    milvus_chunks = self.store.count_by_source(source_file)
+                    # If Milvus has chunks matching the recorded count, file is unchanged
+                    if milvus_chunks > 0 and (row[2] == 0 or milvus_chunks >= row[2]):
+                        return True
+                    # If Milvus has 0 chunks (e.g. wiped or lost), it must re-ingest
+                    return False
+
+                # If status was left in 'processing' from an interrupted run, check Milvus
+                if row[1] == "processing" and row[2] and row[2] > 0:
+                    milvus_chunks = self.store.count_by_source(source_file)
+                    if milvus_chunks >= row[2]:
+                        return True
+
+                return False
 
     def mark_status(
         self,
@@ -160,24 +184,56 @@ class DocumentIngestionWorker:
             return self.chunk_text(content)
         return []
 
+    def _get_previous_status(self, source_file: str) -> str:
+        """Return the current registry status for a file, or empty string if not found."""
+        with psycopg.connect(self.db_uri) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status FROM document_registry WHERE source_file = %s",
+                    (source_file,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else ""
+
     def ingest_single_file(self, file_path: Path) -> Dict[str, Any]:
-        """Ingest a single document with SHA-256 deduplication and status tracking."""
+        """Ingest a single document with SHA-256 deduplication and status tracking.
+
+        If the file was previously in 'failed' or 'processing' state, any
+        leftover partial chunks are deleted from Milvus before re-ingesting
+        to prevent duplicates.
+        """
         rel_name = file_path.name
         doc_type = "pdf" if file_path.suffix.lower() == ".pdf" else "architecture"
 
         try:
             file_hash = self.compute_sha256(file_path)
             if self.is_file_unchanged(rel_name, file_hash):
-                self.mark_status(rel_name, status="skipped_unchanged", doc_type=doc_type)
-                print(f"  [SKIP] '{rel_name}' is unchanged (SHA-256 verified).")
+                self.mark_status(rel_name, status="skipped_unchanged", file_hash=file_hash, doc_type=doc_type)
+                print(f"  [SKIP] '{rel_name}' is unchanged (SHA-256 verified).", flush=True)
                 return {"source_file": rel_name, "status": "skipped_unchanged"}
+
+            # Clean up partial leftovers from a previous interrupted or failed run
+            prev_status = self._get_previous_status(rel_name)
+            if prev_status in ("failed", "processing"):
+                logger.info(
+                    "Previous status for '%s' was '%s'. "
+                    "Deleting stale chunks from Milvus before re-ingesting.",
+                    rel_name, prev_status,
+                )
+                self.store.delete_by_source(rel_name)
 
             self.mark_status(
                 rel_name, status="processing", file_hash=file_hash, doc_type=doc_type
             )
+            logger.info("Starting ingestion of '%s' (type: %s)...", rel_name, doc_type)
             t0 = time.perf_counter()
 
+            logger.info("Parsing '%s'...", rel_name)
             chunks = self.parse_file(file_path)
+            logger.info(
+                "Parsed %d chunk(s) from '%s'. Starting batch embedding and indexing into Milvus...",
+                len(chunks), rel_name
+            )
             self.store.delete_by_source(rel_name)
             inserted = self.store.add_documents_batch(
                 chunks=chunks, source_file=rel_name, doc_type=doc_type
@@ -191,8 +247,10 @@ class DocumentIngestionWorker:
                 doc_type=doc_type,
             )
             elapsed = round(time.perf_counter() - t0, 2)
+            logger.info("Successfully indexed '%s' -> %d chunk(s) in %.2fs", rel_name, inserted, elapsed)
             print(
-                f"  [INDEXED] '{rel_name}' -> {inserted} chunk(s) in {elapsed}s"
+                f"  [INDEXED] '{rel_name}' -> {inserted} chunk(s) in {elapsed}s",
+                flush=True,
             )
             return {
                 "source_file": rel_name,
@@ -201,9 +259,11 @@ class DocumentIngestionWorker:
                 "elapsed_sec": elapsed,
             }
         except Exception as e:
+            error_msg = str(e)
             self.mark_status(rel_name, status="failed", doc_type=doc_type)
-            print(f"  [ERROR] Failed to ingest '{rel_name}': {str(e)}")
-            return {"source_file": rel_name, "status": "failed", "error": str(e)}
+            logger.error("Failed to ingest '%s': %s", rel_name, error_msg)
+            print(f"  [ERROR] Failed to ingest '{rel_name}': {error_msg}", flush=True)
+            return {"source_file": rel_name, "status": "failed", "error": error_msg}
 
     def sync_directory(self, directory: Path = KNOWLEDGE_DIR):
         directory.mkdir(parents=True, exist_ok=True)
@@ -214,7 +274,7 @@ class DocumentIngestionWorker:
         ]
 
         if not files:
-            print(f"[*] No documents found in '{directory}'. Creating a sample architecture doc...")
+            print(f"[*] No documents found in '{directory}'. Creating a sample architecture doc...", flush=True)
             sample_file = directory / "system_design_guidelines.md"
             sample_file.write_text(
                 "# Personal AI OS System Design\n\n"
@@ -228,11 +288,15 @@ class DocumentIngestionWorker:
             )
             files = [sample_file]
 
-        print(f"[*] Scanning {len(files)} file(s) in '{directory.name}/'...")
+        print(f"[*] Scanning {len(files)} file(s) in '{directory.name}/'...", flush=True)
         for file_path in files:
             self.ingest_single_file(file_path)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     worker = DocumentIngestionWorker()
     worker.sync_directory()
