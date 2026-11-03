@@ -7,7 +7,7 @@ import time
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Annotated, TypedDict, List, Literal, Optional, Dict, Any
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 
 import psycopg
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
@@ -34,6 +34,7 @@ from ingest_worker import DocumentIngestionWorker, KNOWLEDGE_DIR  # noqa: E402
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", "")
 DB_URI = os.getenv(
     "POSTGRES_URI", "postgresql://admin:secretpassword@localhost:5432/PaPa_db"
 )
@@ -52,7 +53,7 @@ class AgentState(TypedDict):
 BASE_SYSTEM_PROMPT = """You are a Personal AI Engineer OS Assistant powered by MCP and Agentic RAG.
 You have access to three specialized subsystems:
 1. Second Brain (Milvus Vector DB): Use `search_knowledge` to retrieve past notes, slides, and architecture decisions, and `save_memory_note` to store new knowledge.
-2. Dev & Life Workspace (PostgreSQL & Git): Use `list_pending_tasks`, `create_personal_task`, and `complete_personal_task` to manage tasks, and `inspect_local_git_status`, `get_local_git_diff`, and `get_recent_git_commits` to inspect local git repositories (status, diffs, and commit history).
+2. Dev & Life Workspace (PostgreSQL & Git): Use `list_pending_tasks`, `create_personal_task`, and `complete_personal_task` to manage tasks, and `list_workspace_git_repos`, `inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`, and `set_workspace_dir` to inspect local git repositories and dynamically change the active workspace directory at runtime without server restart.
 3. Web Search (Tavily API): Use `search_web` to find real-time information from the internet when the knowledge base has no relevant results.
 
 === USER LONG-TERM PROFILE ===
@@ -60,12 +61,16 @@ You have access to three specialized subsystems:
 ==============================
 
 KNOWLEDGE-FIRST RETRIEVAL & WEB SEARCH FALLBACK RULES:
-1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or direct git inspection commands like git status, git diff, or git log), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering. Direct git inspection commands (`inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`) should call these workspace tools directly without calling `search_knowledge` first.
-2. Grounded Answer (When Found in Knowledge Base): If `search_knowledge` returns relevant context that answers the user's question, prioritize that information and cite the exact source file inline using the format: `` (for example: ``).
-3. Web Search Fallback (When Not Found in Knowledge Base): If `search_knowledge` returns "No query matched in Second Brain." or retrieved chunks do not adequately answer the question, you MUST call `search_web` to find real-time information from the internet BEFORE answering from general knowledge. When citing web results, use the format: `[Source Title](URL)` inline.
-4. General Knowledge Last Resort: Only if BOTH `search_knowledge` AND `search_web` fail to return useful results, answer using your own general knowledge with a disclaimer: "Note: No results found in knowledge base or web search. Answering from general knowledge."
-5. Save Useful Web Findings: If `search_web` returns highly relevant results that the user would benefit from keeping, proactively suggest using `save_memory_note` to store a summary in the knowledge base for future reference. Let the user decide via the approval flow.
-6. Keep your responses concise, structured, and technical. Never fabricate source filenames or URLs.
+1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or direct git inspection commands like git status, git diff, or git log), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering. Direct git inspection commands (`list_workspace_git_repos`, `inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`, `set_workspace_dir`) should call these workspace tools directly without calling `search_knowledge` first.
+2. Workspace Git Inspection Rules:
+   - All git inspection tools (`inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`) accept an optional `repo_path` parameter (either a repository name inside `WORKSPACE_DIR` or a direct filesystem path). If omitted, they default to the current repository.
+   - If the user asks about a project or repository's git status, diff, or commits and the exact repo name or path is unclear, call `list_workspace_git_repos` first to discover available repositories.
+   - If the user asks to change, switch, or set the workspace directory, use `set_workspace_dir` directly.
+3. Grounded Answer (When Found in Knowledge Base): If `search_knowledge` returns relevant context that answers the user's question, prioritize that information and cite the exact source file inline using the format: `` (for example: ``).
+4. Web Search Fallback (When Not Found in Knowledge Base): If `search_knowledge` returns "No query matched in Second Brain." or retrieved chunks do not adequately answer the question, you MUST call `search_web` to find real-time information from the internet BEFORE answering from general knowledge. When citing web results, use the format: `[Source Title](URL)` inline.
+5. General Knowledge Last Resort: Only if BOTH `search_knowledge` AND `search_web` fail to return useful results, answer using your own general knowledge with a disclaimer: "Note: No results found in knowledge base or web search. Answering from general knowledge."
+6. Save Useful Web Findings: If `search_web` returns highly relevant results that the user would benefit from keeping, proactively suggest using `save_memory_note` to store a summary in the knowledge base for future reference. Let the user decide via the approval flow.
+7. Keep your responses concise, structured, and technical. Never fabricate source filenames or URLs.
 
 Grounding Rules:
 - Personalize your technical responses using the User Long-Term Profile above.
@@ -163,7 +168,11 @@ async def lifespan(app: FastAPI):
             "command": "python",
             "args": [workspace_server_path],
             "transport": "stdio",
-            "env": {**os.environ, "POSTGRES_URI": DB_URI},
+            "env": {
+                **os.environ,
+                "POSTGRES_URI": DB_URI,
+                "WORKSPACE_DIR": WORKSPACE_DIR,
+            },
         },
     }
 
@@ -540,6 +549,59 @@ async def list_knowledge_documents():
     """Return all documents in document_registry and their ingestion status."""
     worker: DocumentIngestionWorker = app.state.ingestion_worker
     return {"documents": worker.list_registered_documents()}
+
+
+class WorkspaceRequest(BaseModel):
+    workspace_dir: str = Field(..., description="New workspace directory path")
+
+
+def _update_env_file(key: str, value: str):
+    """Safely update or insert a key in the .env file without modifying other keys."""
+    env_path = ROOT_DIR / ".env"
+    lines = []
+    found = False
+    if env_path.exists():
+        content = env_path.read_text(encoding="utf-8")
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(f"{key}=") or stripped == key:
+                lines.append(f"{key}={value}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+@app.get("/workspace")
+async def get_workspace():
+    """Return the currently configured workspace directory without restarting."""
+    env_path = ROOT_DIR / ".env"
+    current = ""
+    if env_path.exists():
+        vals = dotenv_values(env_path)
+        current = vals.get("WORKSPACE_DIR") or ""
+    if not current:
+        current = os.getenv("WORKSPACE_DIR", "")
+    return {"workspace_dir": current or str(ROOT_DIR.parent.resolve())}
+
+
+@app.post("/workspace")
+async def update_workspace(req: WorkspaceRequest):
+    """Update the workspace directory configuration at runtime without restarting the server."""
+    cleaned = req.workspace_dir.strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Workspace directory path cannot be empty.")
+
+    for p in cleaned.split(","):
+        target = Path(os.path.expanduser(p.strip())).resolve()
+        if not target.is_dir():
+            raise HTTPException(status_code=400, detail=f"Directory does not exist: {target}")
+
+    os.environ["WORKSPACE_DIR"] = cleaned
+    _update_env_file("WORKSPACE_DIR", cleaned)
+    return {"status": "updated", "workspace_dir": cleaned}
 
 
 if __name__ == "__main__":

@@ -80,6 +80,30 @@ def fetch_knowledge_documents() -> List[Dict[str, Any]]:
     return []
 
 
+def fetch_workspace_dir() -> str:
+    """Fetch active workspace directory from backend."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/workspace", timeout=5)
+        if res.status_code == 200:
+            return res.json().get("workspace_dir", "")
+    except Exception:
+        pass
+    return ""
+
+
+def update_workspace_dir(new_dir: str) -> bool:
+    """Send request to update active workspace directory."""
+    try:
+        res = requests.post(
+            f"{API_BASE_URL}/workspace",
+            json={"workspace_dir": new_dir},
+            timeout=5,
+        )
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
 def get_avatar(role: str):
     if role == "assistant" and Path(BOT_ICON_PATH).exists():
         return BOT_ICON_PATH
@@ -200,6 +224,26 @@ with st.sidebar:
     else:
         memory_text = fetch_long_term_memories()
         st.code(memory_text, language="markdown")
+
+    st.divider()
+
+    # Workspace Directory Configuration Panel
+    st.subheader("Workspace Directory")
+    current_ws = fetch_workspace_dir()
+    new_ws_input = st.text_input(
+        "Active Workspace Path",
+        value=current_ws,
+        help="Path to workspace folder. Can be changed dynamically without restarting.",
+    )
+    if st.button("Update Workspace", use_container_width=True):
+        if new_ws_input and new_ws_input.strip() != current_ws:
+            if update_workspace_dir(new_ws_input.strip()):
+                st.success(f"Workspace updated to: {new_ws_input.strip()}")
+                st.rerun()
+            else:
+                st.error("Failed to update workspace directory. Ensure directory exists.")
+        elif new_ws_input and new_ws_input.strip() == current_ws:
+            st.info("Workspace directory is already set to this path.")
 
     st.divider()
 
