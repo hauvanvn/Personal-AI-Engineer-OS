@@ -74,6 +74,61 @@ def inspect_local_git_status(
     except Exception as e:
         return f"Unable to read Git information at {target}: {str(e)}"
 
+@mcp.tool()
+def get_local_git_diff(
+    staged_only: bool = Field(False, description="Whether to show only staged changes (git diff --staged)"),
+    max_chars: int = Field(8000, description="Maximum characters of diff output to return before truncating"),
+) -> str:
+    """Inspect local git diff for unstaged or staged changes in the repository root."""
+    cmd = ["git", "diff", "--staged"] if staged_only else ["git", "diff"]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return f"Git diff failed: {result.stderr.strip()}"
+        
+        output = result.stdout.strip()
+        if not output:
+            change_type = "staged" if staged_only else "unstaged"
+            return f"No {change_type} changes exist in the repository."
+        
+        if len(output) > max_chars:
+            output = output[:max_chars] + f"\n\n[Diff truncated: exceeded {max_chars} characters limit.]"
+        
+        header = f"=== Git Diff ({'Staged' if staged_only else 'Unstaged'}) ==="
+        return f"{header}\n{output}"
+    except Exception as e:
+        return f"Unable to read git diff: {str(e)}"
+
+@mcp.tool()
+def get_recent_git_commits(
+    limit: int = Field(5, description="Number of recent commits to retrieve"),
+) -> str:
+    """Inspect recent git commit history with summary statistics in the repository root."""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"-n{limit}", "--oneline", "--stat"],
+            cwd=ROOT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return f"Git log failed: {result.stderr.strip()}"
+        
+        output = result.stdout.strip()
+        if not output:
+            return "No commit history found in the repository."
+        
+        return f"=== Recent Commits (Last {limit}) ===\n{output}"
+    except Exception as e:
+        return f"Unable to read git commit history: {str(e)}"
+
 # ==========================================
 # GROUP 2: MUTATE TOOLS (Need Human Approval)
 # ==========================================

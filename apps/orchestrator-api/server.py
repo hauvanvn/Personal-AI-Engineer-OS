@@ -49,10 +49,10 @@ SENSITIVE_MUTATE_TOOLS = {
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
 
-SYSTEM_PROMPT = """You are a Personal AI Engineer OS Assistant powered by MCP and Agentic RAG.
+BASE_SYSTEM_PROMPT = """You are a Personal AI Engineer OS Assistant powered by MCP and Agentic RAG.
 You have access to three specialized subsystems:
 1. Second Brain (Milvus Vector DB): Use `search_knowledge` to retrieve past notes, slides, and architecture decisions, and `save_memory_note` to store new knowledge.
-2. Dev & Life Workspace (PostgreSQL & Git): Use `list_pending_tasks`, `create_personal_task`, and `complete_personal_task` to manage tasks, and `inspect_local_git_status` to inspect local repositories.
+2. Dev & Life Workspace (PostgreSQL & Git): Use `list_pending_tasks`, `create_personal_task`, and `complete_personal_task` to manage tasks, and `inspect_local_git_status`, `get_local_git_diff`, and `get_recent_git_commits` to inspect local git repositories (status, diffs, and commit history).
 3. Web Search (Tavily API): Use `search_web` to find real-time information from the internet when the knowledge base has no relevant results.
 
 === USER LONG-TERM PROFILE ===
@@ -60,7 +60,7 @@ You have access to three specialized subsystems:
 ==============================
 
 KNOWLEDGE-FIRST RETRIEVAL & WEB SEARCH FALLBACK RULES:
-1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or local git status commands), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering.
+1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or direct git inspection commands like git status, git diff, or git log), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering. Direct git inspection commands (`inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`) should call these workspace tools directly without calling `search_knowledge` first.
 2. Grounded Answer (When Found in Knowledge Base): If `search_knowledge` returns relevant context that answers the user's question, prioritize that information and cite the exact source file inline using the format: `` (for example: ``).
 3. Web Search Fallback (When Not Found in Knowledge Base): If `search_knowledge` returns "No query matched in Second Brain." or retrieved chunks do not adequately answer the question, you MUST call `search_web` to find real-time information from the internet BEFORE answering from general knowledge. When citing web results, use the format: `[Source Title](URL)` inline.
 4. General Knowledge Last Resort: Only if BOTH `search_knowledge` AND `search_web` fail to return useful results, answer using your own general knowledge with a disclaimer: "Note: No results found in knowledge base or web search. Answering from general knowledge."
@@ -70,6 +70,8 @@ KNOWLEDGE-FIRST RETRIEVAL & WEB SEARCH FALLBACK RULES:
 Grounding Rules:
 - Personalize your technical responses using the User Long-Term Profile above.
 """
+
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT
 
 # ==========================================
 # FASTAPI LIFESPAN & GRAPH INITIALIZATION
