@@ -6,10 +6,12 @@ from google import genai
 from google.genai import types
 from pathlib import Path
 import logging
+import math
 import os
 import re
 import sys
 import time
+from collections import Counter
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,73 @@ class SecondBrainStore:
         """
         return max(1, int(len(text) / 1.8) + 15)
 
+    @staticmethod
+    def _compute_lexical_score(query: str, text: str) -> float:
+        """Compute a lightweight lexical relevance score between 0.0 and 1.0.
+
+        Uses a BM25-inspired term-frequency approach that rewards exact token
+        overlap. This is especially useful for matching technical identifiers,
+        function names, acronyms, and other terms that semantic embeddings may
+        under-weight.
+
+        Scoring formula (per matching query term):
+            tf_component = tf / (tf + k1)          -- saturating TF (BM25-style)
+            idf_weight   = log(1 + N / (df + 1))   -- IDF across the document
+        Final score is the sum of (tf_component * idf_weight) for all matching
+        query tokens, normalized to [0.0, 1.0].
+
+        Parameters:
+            query: The user search query string.
+            text:  The candidate document text to score against.
+
+        Returns:
+            A float between 0.0 and 1.0 representing lexical relevance.
+        """
+        if not query or not text:
+            return 0.0
+
+        # Tokenize: split on non-alphanumeric boundaries, keep underscores
+        # for identifiers like "search_with_time_decay", then lowercase.
+        _token_pattern = re.compile(r"[A-Za-z0-9_]+")
+        query_tokens = [t.lower() for t in _token_pattern.findall(query)]
+        doc_tokens = [t.lower() for t in _token_pattern.findall(text)]
+
+        if not query_tokens or not doc_tokens:
+            return 0.0
+
+        query_unique = set(query_tokens)
+        doc_freq = Counter(doc_tokens)
+        doc_len = len(doc_tokens)
+
+        # BM25-style saturation constant
+        k1 = 1.2
+        # Treat the single document as N=1 corpus for IDF-like weighting;
+        # terms present get a baseline weight, rarer terms in the doc get more.
+        n_doc = 1.0
+
+        raw_score = 0.0
+        max_possible = 0.0
+
+        for token in query_unique:
+            tf = doc_freq.get(token, 0)
+            # IDF-like weight: penalizes extremely common tokens slightly
+            df = 1.0 if tf > 0 else 0.0
+            idf = math.log(1.0 + n_doc / (df + 1.0))
+
+            # Maximum possible contribution for normalization
+            max_tf_component = 1.0  # when tf is very large, tf/(tf+k1) -> 1
+            max_possible += max_tf_component * idf
+
+            if tf > 0:
+                tf_component = tf / (tf + k1)
+                raw_score += tf_component * idf
+
+        if max_possible <= 0.0:
+            return 0.0
+
+        normalized = raw_score / max_possible
+        return min(1.0, max(0.0, normalized))
+
     def _get_embedding(self, text: str) -> List[float]:
         """Call the Gemini Embedding API for free to obtain a 768-dimensional vector.
 
@@ -140,13 +209,18 @@ class SecondBrainStore:
         min_score: float = 0.50,
     ) -> List[Dict[str, Any]]:
         """
-        Execute semantic search and rerank results by combining Cosine Similarity (85%)
-        with an exponential Time-Decay score (15%), filtering out chunks below min_score.
+        Hybrid search combining Semantic similarity (70%), Lexical keyword
+        matching (15%), and exponential Time-Decay recency (15%).
+
+        A larger candidate pool is fetched from the vector index so that the
+        lexical and recency reranking stages have enough material to surface
+        results that may rank lower on pure cosine but match exact keywords.
+        Results below min_score are filtered out before returning the top_k.
         """
         query_vector = self._get_embedding(query)
 
         filter_expr = f'doc_type == "{doc_type}"' if doc_type else ""
-        candidate_limit = max(top_k * 3, 15)
+        candidate_limit = max(top_k * 5, 25)
 
         search_results = self.client.search(
             collection_name=self.collection_name,
@@ -173,11 +247,20 @@ class SecondBrainStore:
             entity = hit.get("entity", {})
             semantic_score = float(hit.get("distance", 0.0))
 
+            # Lexical keyword relevance score
+            doc_text = entity.get("text", "")
+            lexical_score = self._compute_lexical_score(query, doc_text)
+
+            # Recency score via exponential decay
             created_at = int(entity.get("created_at", now_ts))
             age_hours = max(0.0, (now_ts - created_at) / 3600.0)
             recency_score = np.exp(-decay_rate * age_hours)
 
-            final_score = (0.85 * semantic_score) + (0.15 * recency_score)
+            final_score = (
+                (0.70 * semantic_score)
+                + (0.15 * lexical_score)
+                + (0.15 * recency_score)
+            )
 
             if final_score < min_score:
                 continue
@@ -185,11 +268,12 @@ class SecondBrainStore:
             scored_results.append(
                 {
                     "id": hit.get("id"),
-                    "text": entity.get("text", ""),
+                    "text": doc_text,
                     "source_file": entity.get("source_file", "unknown"),
                     "doc_type": entity.get("doc_type", "document"),
                     "page": entity.get("page", 1),
                     "semantic_score": round(semantic_score, 4),
+                    "lexical_score": round(lexical_score, 4),
                     "recency_score": round(recency_score, 4),
                     "score": round(final_score, 4),
                 }
