@@ -312,6 +312,9 @@ for msg in st.session_state.chat_history:
         if msg.get("latency"):
             st.caption(f"Latency: {msg['latency']}s")
 
+        if msg.get("cached"):
+            st.caption("Source: Redis Response Cache")
+
 
 # ==========================================
 # HUMAN-IN-THE-LOOP (HITL) APPROVAL CARD
@@ -429,6 +432,7 @@ if prompt:
                             "tool_traces": traces,
                             "citations": citations,
                             "latency": latency,
+                            "cached": res.get("cached", False),
                         }
                     )
                     st.rerun()

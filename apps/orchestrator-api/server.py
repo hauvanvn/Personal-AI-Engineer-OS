@@ -23,6 +23,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
 from memory_store import LongTermMemoryManager, extract_clean_text
+from cache_manager import RedisCacheManager
 
 # Load load .env file
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -295,6 +296,7 @@ async def lifespan(app: FastAPI):
         app.state.graph = builder.compile(checkpointer=checkpointer)
         app.state.memory_manager = memory_manager
         app.state.ingestion_worker = ingestion_worker
+        app.state.cache_manager = RedisCacheManager()
         app.state.web_search_enabled = web_search_enabled
         web_status = "ENABLED" if web_search_enabled else "DISABLED (no TAVILY_API_KEY)"
         print(
@@ -411,12 +413,38 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     graph = app.state.graph
+    cache_mgr: RedisCacheManager = app.state.cache_manager
     config = {"configurable": {"thread_id": req.thread_id}}
+
+    # Skip cache when the thread has a pending HITL interrupt
+    state = await graph.aget_state(config)
+    has_pending_interrupt = bool(state.next)
+
+    # Try cache first (only for standard queries without pending interrupt)
+    if not has_pending_interrupt:
+        cached = cache_mgr.get_cached_response(req.message)
+        if cached is not None:
+            cached["status"] = "completed"
+            cached["thread_id"] = req.thread_id
+            cached["latency_sec"] = 0.0
+            return cached
 
     t0 = time.perf_counter()
     await graph.ainvoke({"messages": [HumanMessage(content=req.message)]}, config)
     result = await _inspect_graph_response(graph, app.state.memory_manager, config)
     result["latency_sec"] = round(time.perf_counter() - t0, 2)
+
+    # Cache completed responses only when no sensitive mutate tools were triggered
+    if result.get("status") == "completed":
+        triggered_tools = {t.get("tool_name") for t in result.get("tool_traces", [])}
+        if not triggered_tools & SENSITIVE_MUTATE_TOOLS:
+            cache_mgr.store_response(
+                query=req.message,
+                response=result.get("response", ""),
+                tool_traces=result.get("tool_traces", []),
+                citations=result.get("citations", []),
+            )
+
     return result
 
 
@@ -487,6 +515,9 @@ async def delete_knowledge_document(filename: str):
             detail=f"Document '{filename}' not found in registry or on disk.",
         )
 
+    # Invalidate chat cache after knowledge base change
+    app.state.cache_manager.invalidate_all_chat_cache()
+
     return {
         "status": "deleted",
         "filename": filename,
@@ -532,6 +563,10 @@ async def upload_knowledge_documents(
         worker.mark_status(filename, status="processing", file_hash=file_hash, doc_type=doc_type)
         background_tasks.add_task(worker.ingest_single_file, dest_path)
         queued_files.append(filename)
+
+    # Invalidate chat cache after knowledge base change
+    if queued_files:
+        app.state.cache_manager.invalidate_all_chat_cache()
 
     return {
         "status": "accepted",
