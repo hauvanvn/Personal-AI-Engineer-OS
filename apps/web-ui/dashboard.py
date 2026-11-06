@@ -110,6 +110,79 @@ def get_avatar(role: str):
     return None
 
 
+def fetch_threads() -> List[Dict[str, Any]]:
+    """Fetch the list of conversation threads from the backend."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/threads", timeout=5)
+        if res.status_code == 200:
+            return res.json().get("threads", [])
+    except Exception:
+        return []
+    return []
+
+
+def fetch_thread_messages(thread_id: str) -> List[Dict[str, Any]]:
+    """Fetch the full message history for a given thread from the backend."""
+    try:
+        res = requests.get(
+            f"{API_BASE_URL}/threads/{thread_id}/messages", timeout=10
+        )
+        if res.status_code == 200:
+            return res.json().get("messages", [])
+    except Exception:
+        return []
+    return []
+
+
+def _rebuild_chat_history_from_api(api_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert raw API message list into the session_state chat_history format.
+
+    Groups tool messages as traces under the preceding AI message and maps
+    LangGraph role names ('human', 'ai') to Streamlit roles ('user', 'assistant').
+    """
+    history: List[Dict[str, Any]] = []
+    pending_traces: List[Dict[str, Any]] = []
+    pending_citations: List[Dict[str, Any]] = []
+
+    for msg in api_messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "tool":
+            # Accumulate tool traces to attach to the next AI message
+            for trace in msg.get("tool_traces", []):
+                pending_traces.append(trace)
+            for cit in msg.get("citations", []):
+                pending_citations.append(cit)
+            continue
+
+        if role == "human":
+            # Flush any orphan tool traces before a new user turn
+            pending_traces = []
+            pending_citations = []
+            history.append({"role": "user", "content": content})
+
+        elif role == "ai":
+            if not content and not pending_traces:
+                # Skip empty AI messages (intermediate tool-call-only turns)
+                continue
+            entry: Dict[str, Any] = {
+                "role": "assistant",
+                "content": content,
+                "tool_traces": pending_traces if pending_traces else [],
+                "citations": pending_citations if pending_citations else [],
+            }
+            history.append(entry)
+            pending_traces = []
+            pending_citations = []
+
+        elif role == "system":
+            # System messages are not rendered in chat
+            continue
+
+    return history
+
+
 # ==========================================
 # LEFT SIDEBAR: MEMORY, UPLOAD & SYSTEM STATUS
 # ==========================================
@@ -125,17 +198,57 @@ with st.sidebar:
 
     st.divider()
 
-    # Session Management
-    col1, col2 = st.columns([3, 2])
-    with col1:
-        st.text_input("Thread ID", value=st.session_state.thread_id, disabled=True)
-    with col2:
-        st.write("")
-        if st.button("New Chat", use_container_width=True):
-            st.session_state.thread_id = f"session_{uuid.uuid4().hex[:8]}"
-            st.session_state.chat_history = []
+    # Conversation Sessions Management
+    st.subheader("Conversation Sessions")
+
+    if st.button("New Session", use_container_width=True):
+        st.session_state.thread_id = f"session_{uuid.uuid4().hex[:8]}"
+        st.session_state.chat_history = []
+        st.session_state.pending_interrupt = None
+        st.session_state.pop("thread_selector", None)
+        st.rerun()
+
+    threads = fetch_threads()
+    if threads:
+        thread_labels = []
+        thread_id_map = {}
+        for t in threads:
+            preview = t.get("last_message_preview", "")
+            display = f"{t['thread_id']} -- {preview}" if preview else t["thread_id"]
+            thread_labels.append(display)
+            thread_id_map[display] = t["thread_id"]
+
+        # Determine current selection index; None when active thread is new
+        current_index = None
+        for idx, label in enumerate(thread_labels):
+            if thread_id_map[label] == st.session_state.thread_id:
+                current_index = idx
+                break
+
+        selected_label = st.selectbox(
+            "Previous Sessions",
+            options=thread_labels,
+            index=current_index,
+            placeholder="Select a previous session",
+            key="thread_selector",
+        )
+
+        if selected_label and thread_id_map.get(selected_label, "") != st.session_state.thread_id:
+            # Switch to the selected thread and load its history
+            selected_tid = thread_id_map[selected_label]
+            st.session_state.thread_id = selected_tid
             st.session_state.pending_interrupt = None
+            api_messages = fetch_thread_messages(selected_tid)
+            st.session_state.chat_history = _rebuild_chat_history_from_api(
+                api_messages
+            )
             st.rerun()
+    else:
+        st.caption("No previous sessions found.")
+
+    st.text_input(
+        "Active Thread ID", value=st.session_state.thread_id, disabled=True
+    )
 
     st.divider()
 

@@ -24,6 +24,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 from memory_store import LongTermMemoryManager, extract_clean_text
 from cache_manager import RedisCacheManager
+from thread_store import ThreadMetadataStore
 
 # Load load .env file
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -297,6 +298,7 @@ async def lifespan(app: FastAPI):
         app.state.memory_manager = memory_manager
         app.state.ingestion_worker = ingestion_worker
         app.state.cache_manager = RedisCacheManager()
+        app.state.thread_store = ThreadMetadataStore(db_uri=DB_URI)
         app.state.web_search_enabled = web_search_enabled
         web_status = "ENABLED" if web_search_enabled else "DISABLED (no TAVILY_API_KEY)"
         print(
@@ -445,7 +447,57 @@ async def chat_endpoint(req: ChatRequest):
                 citations=result.get("citations", []),
             )
 
+    # Update thread metadata for conversation history listing
+    preview = req.message[:120]
+    thread_store: ThreadMetadataStore = app.state.thread_store
+    thread_store.upsert_thread(req.thread_id, preview)
+
     return result
+
+
+@app.get("/threads")
+async def list_threads():
+    """Return a list of active conversation thread_ids with their latest message preview."""
+    thread_store: ThreadMetadataStore = app.state.thread_store
+    threads = thread_store.list_threads(limit=50)
+    return {"threads": threads}
+
+
+@app.get("/threads/{thread_id}/messages")
+async def get_thread_messages(thread_id: str):
+    """Read the full conversation history for a given thread from LangGraph state."""
+    graph = app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
+    state = await graph.aget_state(config)
+    messages = state.values.get("messages", [])
+
+    if not messages:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No messages found for thread_id '{thread_id}'.",
+        )
+
+    formatted = []
+    for m in messages:
+        entry: Dict[str, Any] = {
+            "role": m.type,
+            "content": extract_clean_text(m.content),
+        }
+
+        if m.type == "tool":
+            clean_out = extract_clean_text(m.content)
+            tool_trace = {"tool_name": getattr(m, "name", ""), "output": clean_out}
+            citations = []
+            if getattr(m, "name", "") == "search_knowledge":
+                citations = _parse_citations_from_tool_output(clean_out)
+            elif getattr(m, "name", "") == "search_web":
+                citations = _parse_web_citations_from_tool_output(clean_out)
+            entry["tool_traces"] = [tool_trace]
+            entry["citations"] = citations
+
+        formatted.append(entry)
+
+    return {"thread_id": thread_id, "messages": formatted}
 
 
 @app.post("/chat/resume")
