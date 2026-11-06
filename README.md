@@ -130,8 +130,8 @@ PersonalAIAssistant/
   $$\text{Final Score} = 0.70 \times \text{Semantic} + 0.15 \times \text{Lexical} + 0.15 \times \text{Recency}$$
   - **70% Semantic Similarity**: Gemini Embedding 001 (768-dim normalized vectors) with Milvus HNSW indexing.
   - **15% Lexical Matching**: BM25-inspired keyword frequency saturation with IDF weighting for technical identifiers and exact terms.
-  - **15% Time-Decay Recency**: Exponential decay formula $\exp(-0.01 \times \text{age\_hours})$.
-- **Oversampling & Thresholding**: Queries retrieve an expanded candidate pool ($5 \times \text{top\_k}$ or minimum 25) before reranking, filtering out candidates below `min_score` (default 0.50).
+  - **15% Time-Decay Recency**: Exponential decay formula exp(-0.01 x age\_hours).
+- **Oversampling & Thresholding**: Queries retrieve an expanded candidate pool (5 x top\_k or minimum 25) before reranking, filtering out candidates below `min_score` (default 0.50).
 - **Inline Citations**: Grounded responses display exact source file citations with page numbers and relevance scores.
 
 ### 2. Production-Grade Rate-Limit Protection (Free Tier Resilient)
