@@ -89,9 +89,27 @@ def _extract_text(content: Any) -> str:
 
 def _parse_judge_json(raw: str) -> Dict[str, Any]:
     """Parse JSON from LLM output, stripping optional markdown fences."""
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    return json.loads(cleaned)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
+    match = re.search(r"(\{.*\})", cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(1)
+    try:
+        return json.loads(cleaned, strict=False)
+    except Exception:
+        scores: Dict[str, Any] = {}
+        f_match = re.search(r'["\']faithfulness_score["\']\s*:\s*([\d.]+)', raw)
+        r_match = re.search(r'["\']relevance_score["\']\s*:\s*([\d.]+)', raw)
+        rs_match = re.search(r'["\']reasoning["\']\s*:\s*["\']([^"\']*)', raw)
+        if f_match:
+            scores["faithfulness_score"] = float(f_match.group(1))
+        if r_match:
+            scores["relevance_score"] = float(r_match.group(1))
+        if rs_match:
+            scores["reasoning"] = rs_match.group(1)
+        if "faithfulness_score" in scores and "relevance_score" in scores:
+            return scores
+        raise
 
 
 def _percentile(data: List[float], pct: float) -> float:
@@ -140,18 +158,24 @@ class RateLimitPacer:
         for attempt in range(self.max_retries):
             try:
                 result = func(*args, **kwargs)
-                if isinstance(result, requests.Response) and self.is_rate_limit(
-                    result.status_code, result.text
-                ):
-                    delay = self.parse_retry_delay(result.text) or (
-                        2 ** attempt * 5
-                    )
-                    print(
-                        f"  [WARN] Rate limited (attempt {attempt + 1}/{self.max_retries}). "
-                        f"Retrying in {delay:.1f}s ..."
-                    )
-                    await asyncio.sleep(delay)
-                    continue
+                if isinstance(result, requests.Response):
+                    if self.is_rate_limit(result.status_code, result.text):
+                        delay = self.parse_retry_delay(result.text) or (
+                            2 ** attempt * 5
+                        )
+                        print(
+                            f"  [WARN] Rate limited (attempt {attempt + 1}/{self.max_retries}). "
+                            f"Retrying in {delay:.1f}s ..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if result.status_code >= 500 and attempt < self.max_retries - 1:
+                        print(
+                            f"  [WARN] Server returned {result.status_code} (attempt {attempt + 1}/{self.max_retries}). "
+                            f"Retrying in 5.0s ..."
+                        )
+                        await asyncio.sleep(5.0)
+                        continue
                 return result
             except Exception as exc:
                 last_exc = exc
@@ -163,6 +187,12 @@ class RateLimitPacer:
                         f"Retrying in {delay:.1f}s ..."
                     )
                     await asyncio.sleep(delay)
+                elif attempt < self.max_retries - 1:
+                    print(
+                        f"  [WARN] Request failed: {exc} (attempt {attempt + 1}/{self.max_retries}). "
+                        f"Retrying in 5.0s ..."
+                    )
+                    await asyncio.sleep(5.0)
                 else:
                     raise
         if last_exc:
@@ -241,6 +271,15 @@ async def run_rag_suite(api_url: str, pacer: RateLimitPacer) -> SuiteResult:
     print("\n" + "=" * 70)
     print("SUITE 1: RAG -- Hybrid Retrieval & Negative Fallback")
     print("=" * 70)
+
+    # Invalidate Redis cache so test cases execute fresh uncached queries
+    try:
+        from cache_manager import RedisCacheManager
+        cache_mgr = RedisCacheManager()
+        cache_mgr.invalidate_all()
+        print("[INFO] Redis cache invalidated before RAG suite.")
+    except Exception as exc:
+        print(f"[WARN] Failed to invalidate Redis cache before RAG suite: {exc}")
 
     # -- Synthetic knowledge injection --
     synthetic_chunks = [
@@ -416,6 +455,11 @@ async def run_rag_suite(api_url: str, pacer: RateLimitPacer) -> SuiteResult:
             store.delete_by_source(BENCHMARK_SYNTHETIC_SOURCE)
         except Exception as exc:
             print(f"  [WARN] Cleanup failed: {exc}")
+        try:
+            from cache_manager import RedisCacheManager
+            RedisCacheManager().invalidate_all()
+        except Exception:
+            pass
 
     return result
 
@@ -921,6 +965,7 @@ async def run_judge_suite(api_url: str, pacer: RateLimitPacer) -> SuiteResult:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     result = SuiteResult("judge")
+    store = SecondBrainStore()
     print("\n" + "=" * 70)
     print("SUITE 5: JUDGE -- LLM-as-a-Judge Answer Quality")
     print("=" * 70)
@@ -967,110 +1012,153 @@ async def run_judge_suite(api_url: str, pacer: RateLimitPacer) -> SuiteResult:
     faithfulness_scores: List[float] = []
     relevance_scores: List[float] = []
 
-    for jc in judge_cases:
-        thread_id = _bench_thread()
+    judge_synthetic_chunks = [
+        (
+            "The hybrid retrieval pipeline combines 70% semantic similarity, "
+            "15% lexical keyword matching, and 15% time-decay recency scoring "
+            "using a 768-dim HNSW COSINE index over personal knowledge."
+        ),
+    ]
 
-        # Get the actual answer from the orchestrator
-        print(f"  [INFO] {jc['id']}: querying orchestrator ...")
-        t0 = time.perf_counter()
+    try:
+        # Invalidate cache so judge queries run fresh
         try:
-            resp = await pacer.call_with_retry(
-                requests.post,
-                f"{api_url}/chat",
-                json={"thread_id": thread_id, "message": jc["query"]},
-                timeout=60,
-            )
-            data = resp.json()
-        except Exception as exc:
-            result.add_case(
-                case_id=jc["id"],
-                description=jc["description"],
-                status="FAIL",
-                details={"error": f"Orchestrator call failed: {exc}"},
-            )
-            print(f"  [FAIL] {jc['id']}: orchestrator error: {exc}")
-            await pacer.pace()
-            continue
+            from cache_manager import RedisCacheManager
+            RedisCacheManager().invalidate_all()
+        except Exception:
+            pass
 
-        # Handle HITL-interrupted responses (should not happen for read-only queries)
-        if data.get("status") == "interrupted_for_approval":
+        # Clean up any leftover from previous aborted run
+        store.delete_by_source(BENCHMARK_SYNTHETIC_SOURCE)
+        await asyncio.sleep(1)
+
+        print("[INFO] Inserting synthetic benchmark chunk for judge grounding ...")
+        for chunk_text in judge_synthetic_chunks:
+            store.add_document(
+                text=chunk_text,
+                source_file=BENCHMARK_SYNTHETIC_SOURCE,
+                doc_type="architecture",
+            )
+            await asyncio.sleep(1.0)
+        print("[INFO] Judge synthetic chunk inserted successfully.")
+        await asyncio.sleep(2)
+
+        for jc in judge_cases:
+            thread_id = _bench_thread()
+
+            # Get the actual answer from the orchestrator
+            print(f"  [INFO] {jc['id']}: querying orchestrator ...")
+            t0 = time.perf_counter()
             try:
-                requests.post(
-                    f"{api_url}/chat/resume",
-                    json={"thread_id": thread_id, "action": "reject"},
-                    timeout=30,
+                resp = await pacer.call_with_retry(
+                    requests.post,
+                    f"{api_url}/chat",
+                    json={"thread_id": thread_id, "message": jc["query"]},
+                    timeout=60,
                 )
-            except Exception:
-                pass
+                data = resp.json()
+            except Exception as exc:
+                result.add_case(
+                    case_id=jc["id"],
+                    description=jc["description"],
+                    status="FAIL",
+                    details={"error": f"Orchestrator call failed: {exc}"},
+                )
+                print(f"  [FAIL] {jc['id']}: orchestrator error: {exc}")
+                await pacer.pace()
+                continue
+
+            # Handle HITL-interrupted responses (should not happen for read-only queries)
+            if data.get("status") == "interrupted_for_approval":
+                try:
+                    requests.post(
+                        f"{api_url}/chat/resume",
+                        json={"thread_id": thread_id, "action": "reject"},
+                        timeout=30,
+                    )
+                except Exception:
+                    pass
+                result.add_case(
+                    case_id=jc["id"],
+                    description=jc["description"],
+                    status="SKIP",
+                    details={"reason": "Unexpected HITL interruption on read-only query"},
+                )
+                print(f"  [SKIP] {jc['id']}: unexpected HITL interrupt")
+                await pacer.pace()
+                continue
+
+            tool_traces = data.get("tool_traces", [])
+            answer_text = data.get("response", "")
+            context_str = (
+                "\n".join(t.get("output", "") for t in tool_traces) or "No tool context."
+            )
+
+            # Build judge prompt
+            judge_prompt = (
+                f"Question: {jc['query']}\n\n"
+                f"Retrieved Tool Context:\n{context_str}\n\n"
+                f"Assistant Answer:\n{answer_text}\n\n"
+                f"Expected Ground Truth:\n{jc['ground_truth']}"
+            )
+
+            await pacer.pace()
+
+            # Call judge LLM
+            print(f"  [INFO] {jc['id']}: invoking judge LLM ...")
+            try:
+                judge_response = await judge_llm.ainvoke(
+                    [
+                        SystemMessage(content=judge_system_prompt),
+                        HumanMessage(content=judge_prompt),
+                    ]
+                )
+                judge_text = _extract_text(judge_response.content)
+                scores = _parse_judge_json(judge_text)
+                f_score = float(scores.get("faithfulness_score", 0.0))
+                r_score = float(scores.get("relevance_score", 0.0))
+                reasoning = scores.get("reasoning", "")
+            except Exception as exc:
+                f_score = 0.0
+                r_score = 0.0
+                reasoning = f"Judge parsing error: {exc}"
+                print(f"    [WARN] Judge parse error: {exc}")
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            faithfulness_scores.append(f_score)
+            relevance_scores.append(r_score)
+
+            status = "PASS" if f_score >= 0.5 and r_score >= 0.5 else "FAIL"
+            label = "[PASS]" if status == "PASS" else "[FAIL]"
             result.add_case(
                 case_id=jc["id"],
                 description=jc["description"],
-                status="SKIP",
-                details={"reason": "Unexpected HITL interruption on read-only query"},
+                status=status,
+                latency_ms=elapsed_ms,
+                details={
+                    "faithfulness_score": round(f_score, 4),
+                    "relevance_score": round(r_score, 4),
+                    "reasoning": reasoning,
+                },
             )
-            print(f"  [SKIP] {jc['id']}: unexpected HITL interrupt")
+            print(
+                f"  {label} {jc['id']}: faithfulness={f_score:.2f}  "
+                f"relevance={r_score:.2f}  ({elapsed_ms:.0f}ms)"
+            )
+
             await pacer.pace()
-            continue
 
-        tool_traces = data.get("tool_traces", [])
-        answer_text = data.get("response", "")
-        context_str = (
-            "\n".join(t.get("output", "") for t in tool_traces) or "No tool context."
-        )
-
-        # Build judge prompt
-        judge_prompt = (
-            f"Question: {jc['query']}\n\n"
-            f"Retrieved Tool Context:\n{context_str}\n\n"
-            f"Assistant Answer:\n{answer_text}\n\n"
-            f"Expected Ground Truth:\n{jc['ground_truth']}"
-        )
-
-        await pacer.pace()
-
-        # Call judge LLM
-        print(f"  [INFO] {jc['id']}: invoking judge LLM ...")
+    finally:
+        print(f"  [INFO] Cleaning up synthetic source for judge: {BENCHMARK_SYNTHETIC_SOURCE}")
         try:
-            judge_response = await judge_llm.ainvoke(
-                [
-                    SystemMessage(content=judge_system_prompt),
-                    HumanMessage(content=judge_prompt),
-                ]
-            )
-            judge_text = _extract_text(judge_response.content)
-            scores = _parse_judge_json(judge_text)
-            f_score = float(scores.get("faithfulness_score", 0.0))
-            r_score = float(scores.get("relevance_score", 0.0))
-            reasoning = scores.get("reasoning", "")
+            store.delete_by_source(BENCHMARK_SYNTHETIC_SOURCE)
         except Exception as exc:
-            f_score = 0.0
-            r_score = 0.0
-            reasoning = f"Judge parsing error: {exc}"
-            print(f"    [WARN] Judge parse error: {exc}")
-
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        faithfulness_scores.append(f_score)
-        relevance_scores.append(r_score)
-
-        status = "PASS" if f_score >= 0.5 and r_score >= 0.5 else "FAIL"
-        label = "[PASS]" if status == "PASS" else "[FAIL]"
-        result.add_case(
-            case_id=jc["id"],
-            description=jc["description"],
-            status=status,
-            latency_ms=elapsed_ms,
-            details={
-                "faithfulness_score": round(f_score, 4),
-                "relevance_score": round(r_score, 4),
-                "reasoning": reasoning,
-            },
-        )
-        print(
-            f"  {label} {jc['id']}: faithfulness={f_score:.2f}  "
-            f"relevance={r_score:.2f}  ({elapsed_ms:.0f}ms)"
-        )
-
-        await pacer.pace()
+            print(f"  [WARN] Cleanup failed: {exc}")
+        try:
+            from cache_manager import RedisCacheManager
+            RedisCacheManager().invalidate_all()
+        except Exception:
+            pass
 
     n = len(faithfulness_scores)
     result.metrics["avg_faithfulness_score"] = round(

@@ -119,3 +119,7 @@ class RedisCacheManager:
         except redis.RedisError as exc:
             logger.warning("Redis cache invalidation failed: %s", exc)
         return deleted
+
+    def invalidate_all(self) -> int:
+        """Alias for invalidate_all_chat_cache."""
+        return self.invalidate_all_chat_cache()

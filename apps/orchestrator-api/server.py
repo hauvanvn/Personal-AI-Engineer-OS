@@ -331,6 +331,36 @@ class ResumeRequest(BaseModel):
     )
 
 
+FALLBACK_INDICATORS = (
+    "not found in your knowledge base",
+    "not in your knowledge base",
+    "not found in knowledge base",
+    "no results found in knowledge base",
+    "no relevant information in your knowledge base",
+    "no relevant information",
+    "was not found in the knowledge base",
+    "does not contain information about",
+    "not documented in your knowledge base",
+    "not documented in",
+    "not mentioned in your knowledge base",
+    "not found in second brain",
+    "answering from general knowledge",
+    "general knowledge",
+)
+
+
+def _is_fallback_response(text: str) -> bool:
+    """Check if the assistant response indicates fallback to general knowledge."""
+    if not text:
+        return False
+    lower = text.lower()
+    if any(p in lower for p in FALLBACK_INDICATORS):
+        return True
+    if "note:" in lower and "knowledge base" in lower:
+        return True
+    return False
+
+
 async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
     """Check if the graph completed normally or paused at a Human-in-the-Loop interrupt."""
     state = await graph.aget_state(config)
@@ -364,31 +394,25 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
         t.get("tool_name") == "search_web" for t in tool_traces
     )
 
-    kb_miss_phrases = [
-        "not found in your knowledge base",
-        "not found in knowledge base",
-        "no results found in knowledge base",
-        "not found in second brain",
-        "không tìm thấy trong knowledge base",
-        "không có trong knowledge base",
-        "không tìm thấy trong cơ sở tri thức",
-        "answering from general knowledge",
-    ]
-    is_kb_miss = any(p in final_lower for p in kb_miss_phrases)
+    is_kb_miss = _is_fallback_response(final_text)
 
-    filtered_citations = []
-    for cit in citations:
-        if cit.get("source_type") == "web":
-            filtered_citations.append(cit)
-        elif cit.get("source_file"):
-            file_name = Path(cit["source_file"]).name.lower()
-            if has_web_search or is_kb_miss:
-                if file_name in final_lower or f"<{file_name}>" in final_lower:
-                    filtered_citations.append(cit)
-            else:
+    # If fallback indicators are detected, forcefully clear citations
+    # to guarantee zero false citations are returned when falling back.
+    if is_kb_miss:
+        citations = []
+    else:
+        filtered_citations = []
+        for cit in citations:
+            if cit.get("source_type") == "web":
                 filtered_citations.append(cit)
-
-    citations = filtered_citations
+            elif cit.get("source_file"):
+                file_name = Path(cit["source_file"]).name.lower()
+                if has_web_search:
+                    if file_name in final_lower or f"<{file_name}>" in final_lower:
+                        filtered_citations.append(cit)
+                else:
+                    filtered_citations.append(cit)
+        citations = filtered_citations
 
     if state.next and "safety_gatekeeper" in state.next:
         interrupt_val = state.tasks[0].interrupts[0].value
@@ -426,6 +450,9 @@ async def chat_endpoint(req: ChatRequest):
     if not has_pending_interrupt:
         cached = cache_mgr.get_cached_response(req.message)
         if cached is not None:
+            # Guarantee zero citations if cached response indicates fallback
+            if _is_fallback_response(cached.get("response", "")):
+                cached["citations"] = []
             cached["status"] = "completed"
             cached["thread_id"] = req.thread_id
             cached["latency_sec"] = 0.0
@@ -435,6 +462,10 @@ async def chat_endpoint(req: ChatRequest):
     await graph.ainvoke({"messages": [HumanMessage(content=req.message)]}, config)
     result = await _inspect_graph_response(graph, app.state.memory_manager, config)
     result["latency_sec"] = round(time.perf_counter() - t0, 2)
+
+    # Guarantee zero citations on fallback before caching or returning
+    if _is_fallback_response(result.get("response", "")):
+        result["citations"] = []
 
     # Cache completed responses only when no sensitive mutate tools were triggered
     if result.get("status") == "completed":

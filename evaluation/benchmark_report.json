@@ -1,55 +1,55 @@
 {
   "benchmark_version": "2.0",
-  "timestamp": "2026-11-06T09:13:54.098893+00:00",
+  "timestamp": "2026-11-09T08:00:07.744835+00:00",
   "summary": {
-    "total_cases": 4,
-    "passed": 3,
-    "failed": 1,
+    "total_cases": 22,
+    "passed": 22,
+    "failed": 0,
     "skipped": 0,
-    "pass_rate": 0.75,
+    "pass_rate": 1.0,
     "overall_latency_ms": {
-      "mean": 2346.72,
-      "p50": 481.29,
-      "p95": 6870.01
+      "mean": 7606.58,
+      "p50": 7576.07,
+      "p95": 18907.61
     }
   },
   "suites": [
     {
       "suite": "rag",
       "total": 4,
-      "passed": 3,
-      "failed": 1,
+      "passed": 4,
+      "failed": 0,
       "skipped": 0,
       "metrics": {
         "hit_rate_at_1": 1.0,
         "hit_rate_at_3": 1.0,
         "mrr": 1.0,
-        "negative_fallback_pass": false
+        "negative_fallback_pass": true
       },
       "latency_stats_ms": {
-        "mean": 2346.72,
-        "p50": 481.29,
-        "p95": 6870.01
+        "mean": 6358.19,
+        "p50": 452.36,
+        "p95": 20550.69
       },
       "cases": [
         {
           "case_id": "rag_pos_01",
           "description": "Semantic + lexical retrieval of HNSW timeout error",
           "status": "PASS",
-          "latency_ms": 431.12,
+          "latency_ms": 460.36,
           "details": {
             "rank": 1,
             "hit_at_1": true,
             "hit_at_3": true,
             "reciprocal_rank": 1.0,
-            "num_results": 3
+            "num_results": 2
           }
         },
         {
           "case_id": "rag_pos_02",
           "description": "Semantic + lexical retrieval of MRL dimension param",
           "status": "PASS",
-          "latency_ms": 457.08,
+          "latency_ms": 432.02,
           "details": {
             "rank": 1,
             "hit_at_1": true,
@@ -62,25 +62,335 @@
           "case_id": "rag_pos_03",
           "description": "Semantic + lexical retrieval of TPM budget config",
           "status": "PASS",
-          "latency_ms": 505.5,
+          "latency_ms": 444.35,
           "details": {
             "rank": 1,
             "hit_at_1": true,
             "hit_at_3": true,
             "reciprocal_rank": 1.0,
-            "num_results": 3
+            "num_results": 1
           }
         },
         {
           "case_id": "rag_neg_01",
           "description": "Out-of-KB query triggers fallback, zero false citations",
-          "status": "FAIL",
-          "latency_ms": 7993.16,
+          "status": "PASS",
+          "latency_ms": 24096.04,
           "details": {
             "search_knowledge_called": true,
-            "citations_empty": false,
+            "citations_empty": true,
             "has_fallback_phrase": true,
-            "num_citations": 5
+            "num_citations": 0
+          }
+        }
+      ]
+    },
+    {
+      "suite": "tools",
+      "total": 8,
+      "passed": 8,
+      "failed": 0,
+      "skipped": 0,
+      "metrics": {
+        "tool_selection_accuracy": 1.0,
+        "argument_extraction_accuracy": 1.0
+      },
+      "latency_stats_ms": {
+        "mean": 9888.41,
+        "p50": 8851.62,
+        "p95": 16105.94
+      },
+      "cases": [
+        {
+          "case_id": "tool_01",
+          "description": "search_knowledge routing",
+          "status": "PASS",
+          "latency_ms": 11912.35,
+          "details": {
+            "expected_tool": "search_knowledge",
+            "called_tools": [
+              "search_knowledge",
+              "search_web"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_02",
+          "description": "list_pending_tasks routing",
+          "status": "PASS",
+          "latency_ms": 16315.91,
+          "details": {
+            "expected_tool": "list_pending_tasks",
+            "called_tools": [
+              "list_pending_tasks"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_03",
+          "description": "list_workspace_git_repos routing",
+          "status": "PASS",
+          "latency_ms": 15715.98,
+          "details": {
+            "expected_tool": "list_workspace_git_repos",
+            "called_tools": [
+              "list_workspace_git_repos"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_04",
+          "description": "inspect_local_git_status routing",
+          "status": "PASS",
+          "latency_ms": 4211.46,
+          "details": {
+            "expected_tool": "inspect_local_git_status",
+            "called_tools": [
+              "inspect_local_git_status"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_05",
+          "description": "get_local_git_diff routing",
+          "status": "PASS",
+          "latency_ms": 8928.55,
+          "details": {
+            "expected_tool": "get_local_git_diff",
+            "called_tools": [
+              "get_local_git_diff"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_06",
+          "description": "get_recent_git_commits routing",
+          "status": "PASS",
+          "latency_ms": 7837.08,
+          "details": {
+            "expected_tool": "get_recent_git_commits",
+            "called_tools": [
+              "get_recent_git_commits"
+            ],
+            "intercepted_tools": [],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": false
+          }
+        },
+        {
+          "case_id": "tool_07",
+          "description": "create_personal_task routing (sensitive)",
+          "status": "PASS",
+          "latency_ms": 5411.28,
+          "details": {
+            "expected_tool": "create_personal_task",
+            "called_tools": [],
+            "intercepted_tools": [
+              "create_personal_task"
+            ],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": true
+          }
+        },
+        {
+          "case_id": "tool_08",
+          "description": "save_memory_note routing (sensitive)",
+          "status": "PASS",
+          "latency_ms": 8774.69,
+          "details": {
+            "expected_tool": "save_memory_note",
+            "called_tools": [],
+            "intercepted_tools": [
+              "save_memory_note"
+            ],
+            "tool_match": true,
+            "arg_match": true,
+            "interrupted": true
+          }
+        }
+      ]
+    },
+    {
+      "suite": "hitl",
+      "total": 4,
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0,
+      "metrics": {
+        "hitl_interception_accuracy": 1.0,
+        "safe_rejection_success_rate": 1.0
+      },
+      "latency_stats_ms": {
+        "mean": 3388.15,
+        "p50": 2519.08,
+        "p95": 6746.58
+      },
+      "cases": [
+        {
+          "case_id": "hitl_01_intercept",
+          "description": "Interception detection: HITL intercept for create_personal_task",
+          "status": "PASS",
+          "latency_ms": 7315.06,
+          "details": {
+            "interrupted": true,
+            "intercepted_tool": "create_personal_task",
+            "expected_tool": "create_personal_task"
+          }
+        },
+        {
+          "case_id": "hitl_01_reject",
+          "description": "Safe rejection: HITL intercept for create_personal_task",
+          "status": "PASS",
+          "latency_ms": 3525.17,
+          "details": {
+            "resume_status": "completed",
+            "rejection_confirmed": true
+          }
+        },
+        {
+          "case_id": "hitl_02_intercept",
+          "description": "Interception detection: HITL intercept for save_memory_note",
+          "status": "PASS",
+          "latency_ms": 1199.39,
+          "details": {
+            "interrupted": true,
+            "intercepted_tool": "save_memory_note",
+            "expected_tool": "save_memory_note"
+          }
+        },
+        {
+          "case_id": "hitl_02_reject",
+          "description": "Safe rejection: HITL intercept for save_memory_note",
+          "status": "PASS",
+          "latency_ms": 1512.99,
+          "details": {
+            "resume_status": "completed",
+            "rejection_confirmed": true
+          }
+        }
+      ]
+    },
+    {
+      "suite": "cache",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "metrics": {
+        "cache_available": true,
+        "cold_latency_ms": 3058.45,
+        "warm_latency_ms": 8.84,
+        "speedup_factor": 346.08,
+        "cache_hit_accuracy": 1.0,
+        "invalidation_accuracy": 1.0
+      },
+      "latency_stats_ms": {
+        "mean": 7370.43,
+        "p50": 3058.45,
+        "p95": 17445.46
+      },
+      "cases": [
+        {
+          "case_id": "cache_01_cold",
+          "description": "Cold request should not be cached",
+          "status": "PASS",
+          "latency_ms": 3058.45,
+          "details": {
+            "cached_flag": false,
+            "latency_ms": 3058.45
+          }
+        },
+        {
+          "case_id": "cache_02_warm",
+          "description": "Warm request should be cached",
+          "status": "PASS",
+          "latency_ms": 8.84,
+          "details": {
+            "cached_flag": true,
+            "latency_ms": 8.84
+          }
+        },
+        {
+          "case_id": "cache_03_invalidation",
+          "description": "Post-invalidation request should not be cached",
+          "status": "PASS",
+          "latency_ms": 19044.01,
+          "details": {
+            "cached_flag": false,
+            "latency_ms": 19044.01
+          }
+        }
+      ]
+    },
+    {
+      "suite": "judge",
+      "total": 3,
+      "passed": 3,
+      "failed": 0,
+      "skipped": 0,
+      "metrics": {
+        "avg_faithfulness_score": 1.0,
+        "avg_relevance_score": 1.0
+      },
+      "latency_stats_ms": {
+        "mean": 9046.89,
+        "p50": 8209.49,
+        "p95": 10728.39
+      },
+      "cases": [
+        {
+          "case_id": "judge_01",
+          "description": "RAG retrieval pipeline architecture quality",
+          "status": "PASS",
+          "latency_ms": 11008.27,
+          "details": {
+            "faithfulness_score": 1.0,
+            "relevance_score": 1.0,
+            "reasoning": "The assistant accurately answers the question based on the provided context, correctly identifying the weights for semantic similarity and recency."
+          }
+        },
+        {
+          "case_id": "judge_02",
+          "description": "Workspace git listing quality",
+          "status": "PASS",
+          "latency_ms": 7922.92,
+          "details": {
+            "faithfulness_score": 1.0,
+            "relevance_score": 1.0,
+            "reasoning": "The assistant accurately and completely lists the single git repository provided in the tool context without hallucinating."
+          }
+        },
+        {
+          "case_id": "judge_03",
+          "description": "Task listing quality",
+          "status": "PASS",
+          "latency_ms": 8209.49,
+          "details": {
+            "faithfulness_score": 1.0,
+            "relevance_score": 1.0,
+            "reasoning": "The assistant accurately lists the pending task provided in the retrieved context and directly answers the user's question."
           }
         }
       ]

@@ -1,23 +1,23 @@
 # Personal AI Engineer OS -- Benchmark Report v2.0
 
-**Generated:** 2026-11-06T09:13:54.098893+00:00
+**Generated:** 2026-11-09T08:00:07.744835+00:00
 
 ## Executive Summary
 
 | Metric | Value |
 |--------|-------|
-| Total Test Cases | 4 |
-| Passed | 3 |
-| Failed | 1 |
+| Total Test Cases | 22 |
+| Passed | 22 |
+| Failed | 0 |
 | Skipped | 0 |
-| Pass Rate | 75.00% |
-| Mean Latency (ms) | 2346.72 |
-| P50 Latency (ms) | 481.29 |
-| P95 Latency (ms) | 6870.01 |
+| Pass Rate | 100.00% |
+| Mean Latency (ms) | 7606.58 |
+| P50 Latency (ms) | 7576.07 |
+| P95 Latency (ms) | 18907.61 |
 
 ## Suite: RAG
 
-**Results:** 3 passed / 1 failed / 0 skipped (total 4)
+**Results:** 4 passed / 0 failed / 0 skipped (total 4)
 
 ### Metrics
 
@@ -26,24 +26,142 @@
 | hit_rate_at_1 | 1.0000 |
 | hit_rate_at_3 | 1.0000 |
 | mrr | 1.0000 |
-| negative_fallback_pass | False |
+| negative_fallback_pass | True |
 
 ### Latency
 
 | Stat | ms |
 |------|-----|
-| Mean | 2346.72 |
-| P50 | 481.29 |
-| P95 | 6870.01 |
+| Mean | 6358.19 |
+| P50 | 452.36 |
+| P95 | 20550.69 |
 
 ### Test Cases
 
 | Case ID | Description | Status | Latency (ms) |
 |---------|-------------|--------|--------------|
-| rag_pos_01 | Semantic + lexical retrieval of HNSW timeout error | PASS | 431.12 |
-| rag_pos_02 | Semantic + lexical retrieval of MRL dimension param | PASS | 457.08 |
-| rag_pos_03 | Semantic + lexical retrieval of TPM budget config | PASS | 505.5 |
-| rag_neg_01 | Out-of-KB query triggers fallback, zero false citations | FAIL | 7993.16 |
+| rag_pos_01 | Semantic + lexical retrieval of HNSW timeout error | PASS | 460.36 |
+| rag_pos_02 | Semantic + lexical retrieval of MRL dimension param | PASS | 432.02 |
+| rag_pos_03 | Semantic + lexical retrieval of TPM budget config | PASS | 444.35 |
+| rag_neg_01 | Out-of-KB query triggers fallback, zero false citations | PASS | 24096.04 |
+
+## Suite: TOOLS
+
+**Results:** 8 passed / 0 failed / 0 skipped (total 8)
+
+### Metrics
+
+| Metric | Value |
+|--------|-------|
+| tool_selection_accuracy | 1.0000 |
+| argument_extraction_accuracy | 1.0000 |
+
+### Latency
+
+| Stat | ms |
+|------|-----|
+| Mean | 9888.41 |
+| P50 | 8851.62 |
+| P95 | 16105.94 |
+
+### Test Cases
+
+| Case ID | Description | Status | Latency (ms) |
+|---------|-------------|--------|--------------|
+| tool_01 | search_knowledge routing | PASS | 11912.35 |
+| tool_02 | list_pending_tasks routing | PASS | 16315.91 |
+| tool_03 | list_workspace_git_repos routing | PASS | 15715.98 |
+| tool_04 | inspect_local_git_status routing | PASS | 4211.46 |
+| tool_05 | get_local_git_diff routing | PASS | 8928.55 |
+| tool_06 | get_recent_git_commits routing | PASS | 7837.08 |
+| tool_07 | create_personal_task routing (sensitive) | PASS | 5411.28 |
+| tool_08 | save_memory_note routing (sensitive) | PASS | 8774.69 |
+
+## Suite: HITL
+
+**Results:** 4 passed / 0 failed / 0 skipped (total 4)
+
+### Metrics
+
+| Metric | Value |
+|--------|-------|
+| hitl_interception_accuracy | 1.0000 |
+| safe_rejection_success_rate | 1.0000 |
+
+### Latency
+
+| Stat | ms |
+|------|-----|
+| Mean | 3388.15 |
+| P50 | 2519.08 |
+| P95 | 6746.58 |
+
+### Test Cases
+
+| Case ID | Description | Status | Latency (ms) |
+|---------|-------------|--------|--------------|
+| hitl_01_intercept | Interception detection: HITL intercept for create_personal_task | PASS | 7315.06 |
+| hitl_01_reject | Safe rejection: HITL intercept for create_personal_task | PASS | 3525.17 |
+| hitl_02_intercept | Interception detection: HITL intercept for save_memory_note | PASS | 1199.39 |
+| hitl_02_reject | Safe rejection: HITL intercept for save_memory_note | PASS | 1512.99 |
+
+## Suite: CACHE
+
+**Results:** 3 passed / 0 failed / 0 skipped (total 3)
+
+### Metrics
+
+| Metric | Value |
+|--------|-------|
+| cache_available | True |
+| cold_latency_ms | 3058.4500 |
+| warm_latency_ms | 8.8400 |
+| speedup_factor | 346.0800 |
+| cache_hit_accuracy | 1.0000 |
+| invalidation_accuracy | 1.0000 |
+
+### Latency
+
+| Stat | ms |
+|------|-----|
+| Mean | 7370.43 |
+| P50 | 3058.45 |
+| P95 | 17445.46 |
+
+### Test Cases
+
+| Case ID | Description | Status | Latency (ms) |
+|---------|-------------|--------|--------------|
+| cache_01_cold | Cold request should not be cached | PASS | 3058.45 |
+| cache_02_warm | Warm request should be cached | PASS | 8.84 |
+| cache_03_invalidation | Post-invalidation request should not be cached | PASS | 19044.01 |
+
+## Suite: JUDGE
+
+**Results:** 3 passed / 0 failed / 0 skipped (total 3)
+
+### Metrics
+
+| Metric | Value |
+|--------|-------|
+| avg_faithfulness_score | 1.0000 |
+| avg_relevance_score | 1.0000 |
+
+### Latency
+
+| Stat | ms |
+|------|-----|
+| Mean | 9046.89 |
+| P50 | 8209.49 |
+| P95 | 10728.39 |
+
+### Test Cases
+
+| Case ID | Description | Status | Latency (ms) |
+|---------|-------------|--------|--------------|
+| judge_01 | RAG retrieval pipeline architecture quality | PASS | 11008.27 |
+| judge_02 | Workspace git listing quality | PASS | 7922.92 |
+| judge_03 | Task listing quality | PASS | 8209.49 |
 
 ---
 *Report generated by run_benchmark.py v2.0*

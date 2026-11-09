@@ -91,6 +91,21 @@ class SecondBrainStore:
         """
         return max(1, int(len(text) / 1.8) + 15)
 
+    # Common English stopwords and query filler words excluded from lexical
+    # scoring to prevent out-of-domain queries from inflating keyword overlap.
+    _LEXICAL_STOPWORDS: set = {
+        "a", "an", "the", "in", "on", "of", "for", "to", "from", "with",
+        "by", "at", "is", "are", "was", "were", "be", "been", "what", "how",
+        "why", "when", "where", "who", "which", "explain", "describe", "tell",
+        "me", "about", "my", "our", "your", "note", "notes", "documented",
+        "knowledge", "base", "system", "internal", "according", "it", "its",
+        "that", "this", "these", "those", "do", "does", "did", "has", "have",
+        "had", "can", "could", "will", "would", "shall", "should", "may",
+        "might", "must", "and", "or", "but", "not", "no", "so", "if", "then",
+        "than", "also", "just", "only", "very", "all", "any", "each", "every",
+        "some", "such", "both", "few", "more", "most", "other", "into",
+    }
+
     @staticmethod
     def _compute_lexical_score(query: str, text: str) -> float:
         """Compute a lightweight lexical relevance score between 0.0 and 1.0.
@@ -99,6 +114,10 @@ class SecondBrainStore:
         overlap. This is especially useful for matching technical identifiers,
         function names, acronyms, and other terms that semantic embeddings may
         under-weight.
+
+        Common English stopwords and tokens shorter than 2 characters are
+        excluded so that generic filler words in out-of-domain queries do not
+        inflate the lexical score.
 
         Scoring formula (per matching query term):
             tf_component = tf / (tf + k1)          -- saturating TF (BM25-style)
@@ -119,15 +138,24 @@ class SecondBrainStore:
         # Tokenize: split on non-alphanumeric boundaries, keep underscores
         # for identifiers like "search_with_time_decay", then lowercase.
         _token_pattern = re.compile(r"[A-Za-z0-9_]+")
-        query_tokens = [t.lower() for t in _token_pattern.findall(query)]
+        raw_query_tokens = [t.lower() for t in _token_pattern.findall(query)]
         doc_tokens = [t.lower() for t in _token_pattern.findall(text)]
 
-        if not query_tokens or not doc_tokens:
+        if not raw_query_tokens or not doc_tokens:
+            return 0.0
+
+        # Filter out stopwords and very short tokens (< 2 chars) from query
+        stopwords = SecondBrainStore._LEXICAL_STOPWORDS
+        query_tokens = [
+            t for t in raw_query_tokens
+            if len(t) >= 2 and t not in stopwords
+        ]
+
+        if not query_tokens:
             return 0.0
 
         query_unique = set(query_tokens)
         doc_freq = Counter(doc_tokens)
-        doc_len = len(doc_tokens)
 
         # BM25-style saturation constant
         k1 = 1.2
@@ -255,6 +283,16 @@ class SecondBrainStore:
             created_at = int(entity.get("created_at", now_ts))
             age_hours = max(0.0, (now_ts - created_at) / 3600.0)
             recency_score = np.exp(-decay_rate * age_hours)
+
+            # Minimum raw semantic floor: when lexical overlap is negligible,
+            # require a stronger semantic match to prevent time-decay and
+            # residual cosine similarity from pushing unrelated chunks above
+            # min_score.  This filters out-of-KB queries whose stopword-heavy
+            # text otherwise gets an inflated hybrid score.
+            if semantic_score < 0.55 and lexical_score < 0.15:
+                continue
+            if lexical_score == 0.0 and semantic_score < 0.58:
+                continue
 
             final_score = (
                 (0.70 * semantic_score)
