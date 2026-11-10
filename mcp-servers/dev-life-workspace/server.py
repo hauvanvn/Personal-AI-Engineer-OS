@@ -1,4 +1,6 @@
 import os
+import sys
+import json
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -8,6 +10,13 @@ from dotenv import load_dotenv, dotenv_values
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 from pydantic.fields import FieldInfo
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from security_scanner.audit_state import SecurityAuditStateManager
+from security_scanner.repo_cloner import SafeRepoCloner
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -75,7 +84,7 @@ def _update_env_file(key: str, value: str):
 
 
 WORKSPACE_DIR = ROOT_DIR.parent.resolve()
-IGNORE_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__"}
+IGNORE_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".audit_quarantine"}
 
 mcp = FastMCP("Dev-Life-Workspace")
 
@@ -422,6 +431,212 @@ def get_recent_git_commits(
         return f"{header}=== Recent Commits (Last {limit}) ===\n{output}"
     except Exception as e:
         return f"Unable to read git commit history: {str(e)}"
+
+
+def _get_next_security_stage(current_stage: str) -> str:
+    """Map current security audit stage to the next recommended stage."""
+    stage_flow = {
+        "initialized": "workflow_and_packages_scan",
+        "workflow_and_packages_scanned": "static_malware_scan",
+        "static_malware_scanned": "sandbox_probe",
+        "sandbox_probed": "report_generation",
+        "report_generated": "audit_completed",
+    }
+    return stage_flow.get(current_stage, "unknown")
+
+
+@mcp.tool()
+def prepare_repo_for_security_audit(
+    repo_source: str = Field(..., description="Local repo folder name/path inside WORKSPACE_DIR or remote Git URL (https://..., git@..., file://...)"),
+    resume_audit_id: str = Field("", description="Optional existing audit ID to resume an interrupted or rate-limited audit run"),
+    force_new: bool = Field(False, description="Force create a new audit run even if an existing paused/in-progress run exists")
+) -> str:
+    """Step 1 of the Repository Security Audit workflow.
+
+    Prepares a target repository for security auditing. Supports both local repository
+    names inside WORKSPACE_DIR and remote Git URLs (https://, git@, ssh://, file://).
+    Safely clones remote repositories into quarantine with strict security controls
+    (disabled hooks, no symlinks, size limits). Also supports resuming an existing
+    interrupted or rate-limited audit run.
+    """
+    if isinstance(repo_source, FieldInfo):
+        repo_source = str(repo_source.default)
+    if isinstance(resume_audit_id, FieldInfo):
+        resume_audit_id = str(resume_audit_id.default)
+    if isinstance(force_new, FieldInfo):
+        force_new = bool(force_new.default)
+
+    repo_source = str(repo_source or "").strip()
+    resume_audit_id = str(resume_audit_id or "").strip()
+
+    try:
+        state_mgr = SecurityAuditStateManager()
+        state_mgr.ensure_table_exists()
+
+        if resume_audit_id:
+            run = state_mgr.get_audit_run(resume_audit_id)
+            if not run:
+                return json.dumps(
+                    {"error": f"Audit run '{resume_audit_id}' not found.", "status": "not_found"},
+                    indent=2,
+                )
+            local_path = Path(run["resolved_local_path"])
+            if not local_path.exists():
+                return json.dumps(
+                    {
+                        "error": f"Repository directory '{run['resolved_local_path']}' no longer exists on disk.",
+                        "status": "failed",
+                    },
+                    indent=2,
+                )
+            stage_results = run.get("stage_results") or {}
+            return json.dumps(
+                {
+                    "resumed": True,
+                    "audit_id": run["audit_id"],
+                    "repo_source": run["repo_source"],
+                    "source_type": run["source_type"],
+                    "resolved_local_path": run["resolved_local_path"],
+                    "commit_hash": run.get("commit_hash", ""),
+                    "current_stage": run["current_stage"],
+                    "status": run["status"],
+                    "completed_stages": list(stage_results.keys()),
+                    "next_recommended_stage": _get_next_security_stage(run["current_stage"]),
+                },
+                indent=2,
+            )
+
+        if not force_new and repo_source:
+            existing = state_mgr.find_resumable_audit(repo_source)
+            if existing:
+                local_path = Path(existing["resolved_local_path"])
+                if local_path.exists():
+                    stage_results = existing.get("stage_results") or {}
+                    return json.dumps(
+                        {
+                            "resumed": True,
+                            "audit_id": existing["audit_id"],
+                            "repo_source": existing["repo_source"],
+                            "source_type": existing["source_type"],
+                            "resolved_local_path": existing["resolved_local_path"],
+                            "commit_hash": existing.get("commit_hash", ""),
+                            "current_stage": existing["current_stage"],
+                            "status": existing["status"],
+                            "completed_stages": list(stage_results.keys()),
+                            "next_recommended_stage": _get_next_security_stage(existing["current_stage"]),
+                        },
+                        indent=2,
+                    )
+
+        if not repo_source:
+            return json.dumps(
+                {"error": "Repository source must be provided when starting a new audit run.", "status": "failed"},
+                indent=2,
+            )
+
+        cloner = SafeRepoCloner()
+        prep_result = cloner.prepare_repository(repo_source)
+
+        audit_record = state_mgr.create_audit_run(
+            repo_source=prep_result["repo_source"],
+            source_type=prep_result["source_type"],
+            resolved_local_path=prep_result["resolved_local_path"],
+            commit_hash=prep_result["commit_hash"],
+        )
+
+        state_mgr.save_stage_checkpoint(
+            audit_id=audit_record["audit_id"],
+            stage_name="initialized",
+            stage_key="preparation",
+            stage_data=prep_result,
+            status="in_progress",
+        )
+
+        return json.dumps(
+            {
+                "audit_id": audit_record["audit_id"],
+                "repo_source": prep_result["repo_source"],
+                "source_type": prep_result["source_type"],
+                "resolved_local_path": prep_result["resolved_local_path"],
+                "commit_hash": prep_result["commit_hash"],
+                "file_count": prep_result["file_count"],
+                "total_bytes": prep_result["total_bytes"],
+                "current_stage": "initialized",
+                "status": "in_progress",
+                "resumed": False,
+                "next_recommended_stage": "workflow_and_packages_scan",
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "status": "failed"}, indent=2)
+
+
+@mcp.tool()
+def get_security_audit_checkpoint(
+    audit_id: str = Field("", description="Specific audit ID to retrieve"),
+    repo_source: str = Field("", description="Repository source to search for latest audit run if audit_id is omitted"),
+) -> str:
+    """Retrieve checkpoint details, current stage, and stage findings for a security audit run."""
+    if isinstance(audit_id, FieldInfo):
+        audit_id = str(audit_id.default)
+    if isinstance(repo_source, FieldInfo):
+        repo_source = str(repo_source.default)
+
+    audit_id = str(audit_id or "").strip()
+    repo_source = str(repo_source or "").strip()
+
+    try:
+        state_mgr = SecurityAuditStateManager()
+        state_mgr.ensure_table_exists()
+
+        record = None
+        if audit_id:
+            record = state_mgr.get_audit_run(audit_id)
+        elif repo_source:
+            record = state_mgr.get_latest_audit_for_repo(repo_source)
+        else:
+            return json.dumps(
+                {"error": "Either audit_id or repo_source must be provided.", "status": "failed"},
+                indent=2,
+            )
+
+        if not record:
+            return json.dumps(
+                {
+                    "error": f"No audit checkpoint found for audit_id='{audit_id}' repo_source='{repo_source}'.",
+                    "status": "not_found",
+                },
+                indent=2,
+            )
+
+        stage_results = record.get("stage_results") or {}
+        created_at_val = record.get("created_at")
+        updated_at_val = record.get("updated_at")
+
+        return json.dumps(
+            {
+                "audit_id": record["audit_id"],
+                "repo_source": record["repo_source"],
+                "source_type": record["source_type"],
+                "resolved_local_path": record["resolved_local_path"],
+                "commit_hash": record.get("commit_hash", ""),
+                "current_stage": record["current_stage"],
+                "status": record["status"],
+                "completed_stages": list(stage_results.keys()),
+                "static_risk_score": record.get("static_risk_score", 0),
+                "static_risk_verdict": record.get("static_risk_verdict", "PENDING"),
+                "stage_results": stage_results,
+                "report_path": record.get("report_path"),
+                "error_message": record.get("error_message"),
+                "created_at": created_at_val.isoformat() if hasattr(created_at_val, "isoformat") else str(created_at_val),
+                "updated_at": updated_at_val.isoformat() if hasattr(updated_at_val, "isoformat") else str(updated_at_val),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "status": "failed"}, indent=2)
+
 
 # ==========================================
 # GROUP 2: MUTATE TOOLS (Need Human Approval)
