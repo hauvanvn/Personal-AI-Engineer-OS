@@ -17,6 +17,8 @@ if str(CURRENT_DIR) not in sys.path:
 
 from security_scanner.audit_state import SecurityAuditStateManager
 from security_scanner.repo_cloner import SafeRepoCloner
+from security_scanner.workflow_analyzer import RepoWorkflowAnalyzer
+from security_scanner.package_scanner import SuspiciousPackageScanner
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -631,6 +633,136 @@ def get_security_audit_checkpoint(
                 "error_message": record.get("error_message"),
                 "created_at": created_at_val.isoformat() if hasattr(created_at_val, "isoformat") else str(created_at_val),
                 "updated_at": updated_at_val.isoformat() if hasattr(updated_at_val, "isoformat") else str(updated_at_val),
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "status": "failed"}, indent=2)
+
+
+@mcp.tool()
+def analyze_repo_workflow_and_packages(
+    audit_id: str = Field(..., description="Audit ID of the initialized audit run"),
+    force_rescan: bool = Field(False, description="Force re-scan even if workflow_and_packages checkpoint exists")
+) -> str:
+    """Step 2 of the Repository Security Audit workflow.
+
+    Statically analyzes repository architecture, directory structure, primary entrypoints,
+    CI/CD configurations, container orchestration, and dependency manifests across PyPI,
+    NPM, Cargo, and Go ecosystems. Detects typosquatting, untrusted tarballs, direct URLs,
+    and malicious package lifecycle or install hooks.
+    """
+    if isinstance(audit_id, FieldInfo):
+        audit_id = str(audit_id.default)
+    if isinstance(force_rescan, FieldInfo):
+        force_rescan = bool(force_rescan.default)
+
+    audit_id = str(audit_id or "").strip()
+    force_rescan = bool(force_rescan)
+
+    if not audit_id:
+        return json.dumps(
+            {"error": "audit_id must be provided.", "status": "failed"},
+            indent=2,
+        )
+
+    try:
+        state_mgr = SecurityAuditStateManager()
+        state_mgr.ensure_table_exists()
+
+        record = state_mgr.get_audit_run(audit_id)
+        if not record:
+            return json.dumps(
+                {"error": f"Audit run '{audit_id}' not found.", "status": "not_found"},
+                indent=2,
+            )
+
+        stage_results = record.get("stage_results") or {}
+
+        # Checkpoint Cache Hit
+        if not force_rescan and "workflow_and_packages" in stage_results:
+            cached_data = stage_results["workflow_and_packages"]
+            return json.dumps(
+                {
+                    "audit_id": audit_id,
+                    "current_stage": record.get("current_stage", "workflow_and_packages_scanned"),
+                    "from_checkpoint": True,
+                    "static_risk_score": record.get("static_risk_score", 0),
+                    "static_risk_verdict": record.get("static_risk_verdict", "SAFE_SO_FAR"),
+                    "workflow": cached_data.get("workflow", {}),
+                    "packages": cached_data.get("packages", {}),
+                    "next_recommended_stage": "static_malware_scan",
+                },
+                indent=2,
+            )
+
+        resolved_local_path = record.get("resolved_local_path")
+        if not resolved_local_path:
+            return json.dumps(
+                {"error": f"Audit run '{audit_id}' has no resolved_local_path.", "status": "failed"},
+                indent=2,
+            )
+
+        target_path = Path(resolved_local_path)
+        if not target_path.exists() or not target_path.is_dir():
+            return json.dumps(
+                {
+                    "error": f"Repository directory '{resolved_local_path}' does not exist on disk.",
+                    "status": "failed",
+                },
+                indent=2,
+            )
+
+        # Execute analyzers
+        workflow_analyzer = RepoWorkflowAnalyzer()
+        workflow_result = workflow_analyzer.analyze(target_path)
+
+        package_scanner = SuspiciousPackageScanner()
+        package_result = package_scanner.scan(target_path)
+
+        stage_data = {
+            "workflow": workflow_result,
+            "packages": package_result,
+        }
+
+        # Calculate static risk score and verdict
+        all_findings = package_result.get("suspicious_packages", []) + package_result.get("install_hooks_detected", [])
+        has_critical = any(f.get("severity") == "CRITICAL" for f in all_findings)
+        has_high = any(f.get("severity") == "HIGH" for f in all_findings)
+        has_medium = any(f.get("severity") == "MEDIUM" for f in all_findings)
+
+        if has_critical:
+            static_risk_verdict = "CRITICAL_DANGER"
+        elif has_high:
+            static_risk_verdict = "HIGH_RISK"
+        elif has_medium:
+            static_risk_verdict = "CAUTION"
+        else:
+            static_risk_verdict = "SAFE_SO_FAR"
+
+        static_risk_score = package_result.get("package_risk_score", 0)
+
+        # Save stage checkpoint to PostgreSQL
+        state_mgr.save_stage_checkpoint(
+            audit_id=audit_id,
+            stage_name="workflow_and_packages_scanned",
+            stage_key="workflow_and_packages",
+            stage_data=stage_data,
+            status="in_progress",
+            static_risk_score=static_risk_score,
+            static_risk_verdict=static_risk_verdict,
+        )
+
+        return json.dumps(
+            {
+                "audit_id": audit_id,
+                "current_stage": "workflow_and_packages_scanned",
+                "from_checkpoint": False,
+                "static_risk_score": static_risk_score,
+                "static_risk_verdict": static_risk_verdict,
+                "workflow": workflow_result,
+                "packages": package_result,
+                "next_recommended_stage": "static_malware_scan",
             },
             indent=2,
         )
