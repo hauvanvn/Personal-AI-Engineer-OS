@@ -20,6 +20,7 @@ from security_scanner.repo_cloner import SafeRepoCloner
 from security_scanner.workflow_analyzer import RepoWorkflowAnalyzer
 from security_scanner.package_scanner import SuspiciousPackageScanner
 from security_scanner.malware_scanner import StaticMalwareScanner
+from security_scanner.sandbox_probe import IsolatedSandboxProbe
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -898,6 +899,104 @@ def scan_repo_static_malware(
                 "sandbox_eligible": scan_result["sandbox_eligible"],
                 "scan_result": scan_result,
                 "next_recommended_stage": next_stage,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e), "status": "failed"}, indent=2)
+
+
+@mcp.tool()
+def run_repo_sandbox_probe(
+    audit_id: str = Field(..., description="Audit ID of the security audit run to probe"),
+    force_run: bool = Field(False, description="Force sandbox execution even if static verdict is CRITICAL_DANGER or HIGH_RISK"),
+    force_rescan: bool = Field(False, description="Force re-probe even if sandbox_probe checkpoint already exists"),
+) -> str:
+    """Step 4 of the Repository Security Audit workflow.
+
+    Runs repository entrypoints inside an isolated runtime sandbox (Docker container
+    with --network none or hardened subprocess fallback) to discover dynamic behavior:
+    network connection attempts, file access patterns, process spawns, and environment
+    variable inspection. Captures all telemetry via sitecustomize.py monkey-patching
+    without allowing any real outbound network connections.
+    """
+    if isinstance(audit_id, FieldInfo):
+        audit_id = str(audit_id.default)
+    if isinstance(force_run, FieldInfo):
+        force_run = bool(force_run.default)
+    if isinstance(force_rescan, FieldInfo):
+        force_rescan = bool(force_rescan.default)
+
+    audit_id = str(audit_id or "").strip()
+    force_run = bool(force_run)
+    force_rescan = bool(force_rescan)
+
+    if not audit_id:
+        return json.dumps(
+            {"error": "audit_id must be provided.", "status": "failed"},
+            indent=2,
+        )
+
+    try:
+        state_mgr = SecurityAuditStateManager()
+        state_mgr.ensure_table_exists()
+
+        record = state_mgr.get_audit_run(audit_id)
+        if not record:
+            return json.dumps(
+                {"error": f"Audit run '{audit_id}' not found.", "status": "not_found"},
+                indent=2,
+            )
+
+        stage_results = record.get("stage_results") or {}
+
+        # Checkpoint Cache Hit
+        if not force_rescan and "sandbox_probe" in stage_results:
+            cached_data = stage_results["sandbox_probe"]
+            return json.dumps(
+                {
+                    "audit_id": audit_id,
+                    "current_stage": record.get("current_stage", "sandbox_probed"),
+                    "from_checkpoint": True,
+                    "probe_result": cached_data,
+                    "next_recommended_stage": "generate_security_report",
+                },
+                indent=2,
+            )
+
+        # Execute sandbox probe
+        probe = IsolatedSandboxProbe()
+        probe_result = probe.run_probe(
+            audit_record=record,
+            force_run=force_run,
+        )
+
+        # If sandbox_risk_verdict == CRITICAL_DANGER, escalate overall verdict
+        current_score = record.get("static_risk_score", 0)
+        current_verdict = record.get("static_risk_verdict", "PENDING")
+
+        if probe_result.get("sandbox_risk_verdict") == "CRITICAL_DANGER":
+            current_verdict = "CRITICAL_DANGER"
+            current_score = max(current_score, 90)
+
+        # Save stage checkpoint
+        state_mgr.save_stage_checkpoint(
+            audit_id=audit_id,
+            stage_name="sandbox_probed",
+            stage_key="sandbox_probe",
+            stage_data=probe_result,
+            status="in_progress",
+            static_risk_score=current_score,
+            static_risk_verdict=current_verdict,
+        )
+
+        return json.dumps(
+            {
+                "audit_id": audit_id,
+                "current_stage": "sandbox_probed",
+                "from_checkpoint": False,
+                "probe_result": probe_result,
+                "next_recommended_stage": "generate_security_report",
             },
             indent=2,
         )

@@ -121,9 +121,11 @@ def _setup_mock_clean_repo(target_dir: Path) -> None:
         shutil.rmtree(target_dir, ignore_errors=True)
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. main.py with clean calculation functions
+    # 1. main.py with clean calculation functions and deterministic runtime telemetry test
     main_py = target_dir / "main.py"
     main_py.write_text(
+        'import os\n'
+        'import urllib.request\n\n\n'
         'def calculate_sum(a: int, b: int) -> int:\n'
         '    """Calculate the sum of two integers."""\n'
         '    return a + b\n\n\n'
@@ -131,7 +133,13 @@ def _setup_mock_clean_repo(target_dir: Path) -> None:
         '    """Calculate the product of two integers."""\n'
         '    return a * b\n\n\n'
         'if __name__ == "__main__":\n'
-        '    print(f"Sum: {calculate_sum(5, 7)}")\n',
+        '    print(f"Sum: {calculate_sum(5, 7)}")\n'
+        '    env_val = os.getenv("APP_ENV", "production")\n'
+        '    print(f"Environment: {env_val}")\n'
+        '    try:\n'
+        '        urllib.request.urlopen("https://telemetry.example.org/api/v1/ping", timeout=1)\n'
+        '    except Exception:\n'
+        '        pass\n',
         encoding="utf-8",
     )
 
