@@ -14,6 +14,7 @@ from .workflow_analyzer import RepoWorkflowAnalyzer
 from .package_scanner import SuspiciousPackageScanner
 from .malware_scanner import StaticMalwareScanner
 from .sandbox_probe import IsolatedSandboxProbe
+from .report_generator import SecurityAuditReportGenerator
 
 __all__ = [
     "SecurityAuditStateManager",
@@ -25,4 +26,5 @@ __all__ = [
     "SuspiciousPackageScanner",
     "StaticMalwareScanner",
     "IsolatedSandboxProbe",
+    "SecurityAuditReportGenerator",
 ]

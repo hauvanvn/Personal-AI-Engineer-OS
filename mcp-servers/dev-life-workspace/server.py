@@ -21,6 +21,7 @@ from security_scanner.workflow_analyzer import RepoWorkflowAnalyzer
 from security_scanner.package_scanner import SuspiciousPackageScanner
 from security_scanner.malware_scanner import StaticMalwareScanner
 from security_scanner.sandbox_probe import IsolatedSandboxProbe
+from security_scanner.report_generator import SecurityAuditReportGenerator
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
@@ -1119,6 +1120,44 @@ def inspect_repo_file_lines(
             },
             indent=2,
         )
+    except Exception as e:
+        return json.dumps({"error": str(e), "status": "failed"}, indent=2)
+
+
+@mcp.tool()
+def generate_security_audit_report(
+    audit_id: str = Field(..., description="Audit ID of the security audit run to generate report for"),
+    auto_run_missing_stages: bool = Field(True, description="Whether to automatically execute any remaining/missing audit stages prior to report generation"),
+) -> str:
+    """Step 5 of the Repository Security Audit workflow.
+
+    Synthesizes all checkpointed static and dynamic security analysis findings
+    into a comprehensive Markdown report saved to knowledge_base/security_reports/.
+    Automatically completes any missing audit stages (workflow analysis, package
+    scanning, static malware scan, sandbox probe) from previous checkpoints if
+    auto_run_missing_stages is True. Marks the audit run status as completed.
+    """
+    if isinstance(audit_id, FieldInfo):
+        audit_id = str(audit_id.default)
+    if isinstance(auto_run_missing_stages, FieldInfo):
+        auto_run_missing_stages = bool(auto_run_missing_stages.default)
+
+    audit_id = str(audit_id or "").strip()
+    auto_run_missing_stages = bool(auto_run_missing_stages)
+
+    if not audit_id:
+        return json.dumps(
+            {"error": "audit_id must be provided.", "status": "failed"},
+            indent=2,
+        )
+
+    try:
+        report_generator = SecurityAuditReportGenerator()
+        result = report_generator.generate_report(
+            audit_id=audit_id,
+            auto_run_missing_stages=auto_run_missing_stages,
+        )
+        return json.dumps(result, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "status": "failed"}, indent=2)
 

@@ -63,7 +63,7 @@ You have access to three specialized subsystems:
 ==============================
 
 KNOWLEDGE-FIRST RETRIEVAL & WEB SEARCH FALLBACK RULES:
-1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management or direct git inspection commands like git status, git diff, or git log), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering. Direct git inspection commands (`list_workspace_git_repos`, `inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`, `set_workspace_dir`) should call these workspace tools directly without calling `search_knowledge` first.
+1. Priority Lookup: For any informational, technical, architectural, project-related, or factual question (excluding direct task management, direct git inspection commands like git status, git diff, or git log, or direct repository security audit commands), you MUST call `search_knowledge` and include inline citations at the end of relevant sentences in the exact format FIRST before answering. Direct git inspection commands (`list_workspace_git_repos`, `inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`, `set_workspace_dir`) should call these workspace tools directly without calling `search_knowledge` first.
 2. Workspace Git Inspection Rules:
    - All git inspection tools (`inspect_local_git_status`, `get_local_git_diff`, `get_recent_git_commits`) accept an optional `repo_path` parameter (either a repository name inside `WORKSPACE_DIR` or a direct filesystem path). If omitted, they default to the current repository.
    - If the user asks about a project or repository's git status, diff, or commits and the exact repo name or path is unclear, call `list_workspace_git_repos` first to discover available repositories.
@@ -73,6 +73,7 @@ KNOWLEDGE-FIRST RETRIEVAL & WEB SEARCH FALLBACK RULES:
 5. General Knowledge Last Resort: Only if BOTH `search_knowledge` AND `search_web` fail to return useful results, answer using your own general knowledge with a disclaimer: "Note: No results found in knowledge base or web search. Answering from general knowledge."
 6. Save Useful Web Findings: If `search_web` returns highly relevant results that the user would benefit from keeping, proactively suggest using `save_memory_note` to store a summary in the knowledge base for future reference. Let the user decide via the approval flow.
 7. Keep your responses concise, structured, and technical. Never fabricate source filenames or URLs.
+8. Repository Security Audit Rules: For repository security audit requests (local repo name or remote Git URL), use the security audit toolchain in order: prepare_repo_for_security_audit -> analyze_repo_workflow_and_packages -> scan_repo_static_malware -> run_repo_sandbox_probe -> generate_security_audit_report (or call generate_security_audit_report(audit_id, auto_run_missing_stages=True) to complete remaining stages from a checkpoint). Never call search_knowledge for direct repository security audit commands.
 
 Grounding Rules:
 - Personalize your technical responses using the User Long-Term Profile above.
@@ -436,6 +437,42 @@ async def _inspect_graph_response(graph, memory_manager, config: dict) -> dict:
     }
 
 
+def _handle_potential_rate_limit_checkpoint(error_str: str) -> Optional[Dict[str, Any]]:
+    """Check for an in_progress security audit run and pause it due to API rate limiting."""
+    try:
+        with psycopg.connect(DB_URI) as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM security_audit_runs
+                    WHERE status = 'in_progress'
+                    ORDER BY updated_at DESC
+                    LIMIT 1;
+                    """
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                audit_id = row["audit_id"]
+                cur.execute(
+                    """
+                    UPDATE security_audit_runs
+                    SET status = 'rate_limited_paused',
+                        error_message = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE audit_id = %s
+                    RETURNING *;
+                    """,
+                    (error_str[:500], audit_id),
+                )
+                updated_row = cur.fetchone()
+            conn.commit()
+            return dict(updated_row) if updated_row else None
+    except Exception as e:
+        print(f"[!] Error handling rate limit checkpoint: {e}")
+        return None
+
+
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
     graph = app.state.graph
@@ -459,8 +496,32 @@ async def chat_endpoint(req: ChatRequest):
             return cached
 
     t0 = time.perf_counter()
-    await graph.ainvoke({"messages": [HumanMessage(content=req.message)]}, config)
-    result = await _inspect_graph_response(graph, app.state.memory_manager, config)
+    try:
+        await graph.ainvoke({"messages": [HumanMessage(content=req.message)]}, config)
+        result = await _inspect_graph_response(graph, app.state.memory_manager, config)
+    except Exception as e:
+        err_msg = str(e)
+        if any(kw in err_msg.lower() for kw in ["429", "resource_exhausted", "quota"]):
+            paused_run = _handle_potential_rate_limit_checkpoint(err_msg)
+            audit_id = paused_run.get("audit_id") if paused_run else None
+            current_stage = paused_run.get("current_stage") if paused_run else None
+            return {
+                "status": "completed",
+                "thread_id": req.thread_id,
+                "response": (
+                    f"Note: Gemini API rate limit reached. Security audit progress has been safely "
+                    f"saved at checkpoint [audit_id={audit_id}, stage={current_stage}]. "
+                    f"You can resume from this checkpoint without losing progress."
+                ),
+                "checkpoint_paused": True,
+                "audit_id": audit_id,
+                "current_stage": current_stage,
+                "tool_traces": [],
+                "citations": [],
+                "latency_sec": round(time.perf_counter() - t0, 2),
+            }
+        raise
+
     result["latency_sec"] = round(time.perf_counter() - t0, 2)
 
     # Guarantee zero citations on fallback before caching or returning
@@ -720,6 +781,151 @@ async def update_workspace(req: WorkspaceRequest):
     os.environ["WORKSPACE_DIR"] = cleaned
     _update_env_file("WORKSPACE_DIR", cleaned)
     return {"status": "updated", "workspace_dir": cleaned}
+
+
+# ==========================================
+# REPOSITORY SECURITY AUDIT ENDPOINTS
+# ==========================================
+
+workspace_pkg_path = str(ROOT_DIR / "mcp-servers" / "dev-life-workspace")
+if workspace_pkg_path not in sys.path:
+    sys.path.insert(0, workspace_pkg_path)
+
+
+@app.get("/security/audits")
+async def list_security_audits(limit: int = 20):
+    """Retrieve recent repository security audit runs ordered by latest update."""
+    try:
+        with psycopg.connect(DB_URI) as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM security_audit_runs
+                    ORDER BY updated_at DESC
+                    LIMIT %s;
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+
+        audits = []
+        for r in rows:
+            d = dict(r)
+            if "created_at" in d and hasattr(d["created_at"], "isoformat"):
+                d["created_at"] = d["created_at"].isoformat()
+            if "updated_at" in d and hasattr(d["updated_at"], "isoformat"):
+                d["updated_at"] = d["updated_at"].isoformat()
+            audits.append(d)
+
+        return {"audits": audits}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to query audit runs: {str(e)}")
+
+
+@app.get("/security/audits/{audit_id}")
+async def get_security_audit(audit_id: str):
+    """Retrieve full details of a specific security audit run by audit_id."""
+    try:
+        with psycopg.connect(DB_URI) as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    "SELECT * FROM security_audit_runs WHERE audit_id = %s;",
+                    (audit_id,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Security audit run '{audit_id}' not found.",
+            )
+
+        d = dict(row)
+        if "created_at" in d and hasattr(d["created_at"], "isoformat"):
+            d["created_at"] = d["created_at"].isoformat()
+        if "updated_at" in d and hasattr(d["updated_at"], "isoformat"):
+            d["updated_at"] = d["updated_at"].isoformat()
+        return d
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch audit: {str(e)}")
+
+
+@app.get("/security/audits/{audit_id}/report")
+async def get_security_audit_report(audit_id: str):
+    """Read and return generated Markdown report content from disk for a completed audit."""
+    try:
+        with psycopg.connect(DB_URI) as conn:
+            with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+                cur.execute(
+                    "SELECT audit_id, report_path FROM security_audit_runs WHERE audit_id = %s;",
+                    (audit_id,),
+                )
+                row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Security audit run '{audit_id}' not found.",
+            )
+
+        report_path_str = row.get("report_path")
+        if not report_path_str:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No report has been generated yet for audit '{audit_id}'.",
+            )
+
+        report_file = Path(report_path_str)
+        if not report_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Report file not found on disk at '{report_path_str}'.",
+            )
+
+        content = report_file.read_text(encoding="utf-8")
+        return {
+            "audit_id": audit_id,
+            "report_path": report_path_str,
+            "markdown": content,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read audit report: {str(e)}")
+
+
+@app.post("/security/audits/{audit_id}/resume")
+async def resume_security_audit(audit_id: str):
+    """Deterministically complete remaining audit stages and generate final report."""
+    try:
+        from security_scanner.report_generator import SecurityAuditReportGenerator
+
+        generator = SecurityAuditReportGenerator(db_uri=DB_URI)
+        result = generator.generate_report(audit_id=audit_id, auto_run_missing_stages=True)
+        record = generator.state_mgr.get_audit_run(audit_id)
+
+        if record:
+            if "created_at" in record and hasattr(record["created_at"], "isoformat"):
+                record["created_at"] = record["created_at"].isoformat()
+            if "updated_at" in record and hasattr(record["updated_at"], "isoformat"):
+                record["updated_at"] = record["updated_at"].isoformat()
+
+        return {
+            "status": "completed",
+            "audit_id": audit_id,
+            "report_path": result.get("report_path"),
+            "final_verdict": result.get("final_verdict"),
+            "audit_record": record,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to resume security audit '{audit_id}': {str(e)}",
+        )
 
 
 if __name__ == "__main__":
