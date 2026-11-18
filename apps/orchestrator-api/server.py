@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import importlib.util
+import json
 import os
 import sys
 import re
@@ -925,6 +927,105 @@ async def resume_security_audit(audit_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to resume security audit '{audit_id}': {str(e)}",
+        )
+
+
+_WS_SERVER_MODULE = None
+
+
+def _get_workspace_server_module():
+    global _WS_SERVER_MODULE
+    if _WS_SERVER_MODULE is None:
+        ws_server_path = ROOT_DIR / "mcp-servers" / "dev-life-workspace" / "server.py"
+        spec = importlib.util.spec_from_file_location("dev_life_workspace_server", str(ws_server_path))
+        _WS_SERVER_MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_WS_SERVER_MODULE)
+    return _WS_SERVER_MODULE
+
+
+class StartAuditRequest(BaseModel):
+    repo_source: str
+    force_new: bool = False
+
+
+@app.post("/security/audits/start")
+async def start_security_audit(req: StartAuditRequest):
+    """Start a full deterministic security scan and report generation directly."""
+    try:
+        from security_scanner.report_generator import SecurityAuditReportGenerator
+
+        ws_mod = _get_workspace_server_module()
+        prep_raw = ws_mod.prepare_repo_for_security_audit(
+            repo_source=req.repo_source,
+            force_new=req.force_new,
+        )
+        prep_data = json.loads(prep_raw)
+        if "error" in prep_data:
+            raise HTTPException(status_code=400, detail=prep_data["error"])
+
+        audit_id = prep_data["audit_id"]
+
+        generator = SecurityAuditReportGenerator(db_uri=DB_URI)
+        report_res = generator.generate_report(audit_id=audit_id, auto_run_missing_stages=True)
+        record = generator.state_mgr.get_audit_run(audit_id)
+
+        if record:
+            if "created_at" in record and hasattr(record["created_at"], "isoformat"):
+                record["created_at"] = record["created_at"].isoformat()
+            if "updated_at" in record and hasattr(record["updated_at"], "isoformat"):
+                record["updated_at"] = record["updated_at"].isoformat()
+
+        static_verdict = record.get("static_risk_verdict") if record else None
+        final_verdict = static_verdict if static_verdict == "CRITICAL_DANGER" else report_res.get("final_verdict", static_verdict)
+
+        return {
+            "status": "completed",
+            "audit_id": audit_id,
+            "report_path": report_res.get("report_path"),
+            "final_verdict": final_verdict,
+            "static_risk_verdict": static_verdict,
+            "audit_record": record,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start security audit for '{req.repo_source}': {str(e)}",
+        )
+
+
+@app.delete("/security/audits/{audit_id}")
+async def delete_security_audit(audit_id: str):
+    """Delete a security audit run record and its generated Markdown report file from disk."""
+    try:
+        from security_scanner.audit_state import SecurityAuditStateManager
+
+        state_mgr = SecurityAuditStateManager(db_uri=DB_URI)
+        record = state_mgr.get_audit_run(audit_id)
+        if not record:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Security audit run '{audit_id}' not found.",
+            )
+
+        report_path_str = record.get("report_path")
+        if report_path_str:
+            try:
+                rp = Path(report_path_str)
+                if rp.exists():
+                    rp.unlink()
+            except Exception:
+                pass
+
+        state_mgr.delete_audit_run(audit_id)
+        return {"status": "deleted", "audit_id": audit_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete security audit '{audit_id}': {str(e)}",
         )
 
 

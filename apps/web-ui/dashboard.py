@@ -104,6 +104,63 @@ def update_workspace_dir(new_dir: str) -> bool:
         return False
 
 
+def fetch_security_audits(limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch recent repository security audit runs from backend."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/security/audits?limit={limit}", timeout=5)
+        if res.status_code == 200:
+            return res.json().get("audits", [])
+    except Exception:
+        return []
+    return []
+
+
+def fetch_security_audit_report(audit_id: str) -> Dict[str, Any]:
+    """Fetch generated report markdown content for an audit run."""
+    try:
+        res = requests.get(f"{API_BASE_URL}/security/audits/{audit_id}/report", timeout=10)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        return {}
+    return {}
+
+
+def resume_security_audit_api(audit_id: str) -> Dict[str, Any]:
+    """Resume an interrupted or paused audit run from checkpoint."""
+    try:
+        res = requests.post(f"{API_BASE_URL}/security/audits/{audit_id}/resume", timeout=90)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        return {}
+    return {}
+
+
+def start_security_audit_api(repo_source: str, force_new: bool = True) -> Dict[str, Any]:
+    """Trigger a full direct security audit scan."""
+    try:
+        res = requests.post(
+            f"{API_BASE_URL}/security/audits/start",
+            json={"repo_source": repo_source, "force_new": force_new},
+            timeout=120,
+        )
+        if res.status_code == 200:
+            return res.json()
+        return {"error": res.text}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def delete_security_audit_api(audit_id: str) -> bool:
+    """Delete a security audit run record and disk report."""
+    try:
+        res = requests.delete(f"{API_BASE_URL}/security/audits/{audit_id}", timeout=10)
+        return res.status_code == 200
+    except Exception:
+        return False
+
+
 def get_avatar(role: str):
     if role == "assistant" and Path(BOT_ICON_PATH).exists():
         return BOT_ICON_PATH
@@ -370,6 +427,89 @@ with st.sidebar:
         """
     )
 
+    st.divider()
+
+    # Repository Security Auditor Section
+    st.subheader("Repository Security Auditor")
+    repo_input = st.text_input(
+        "Repo Name or Git URL",
+        key="sec_audit_repo_input",
+        placeholder="e.g. my-repo or https://github.com/...",
+    )
+    col_audit1, col_audit2 = st.columns(2)
+    with col_audit1:
+        if st.button("Audit via Chat", use_container_width=True):
+            if repo_input and repo_input.strip():
+                st.session_state["pending_chat_prompt"] = (
+                    f"Run a full security audit on repository: {repo_input.strip()} and generate the markdown report."
+                )
+                st.rerun()
+            else:
+                st.warning("Please enter a repository name or Git URL.")
+    with col_audit2:
+        if st.button("Run Direct Scan", use_container_width=True):
+            if repo_input and repo_input.strip():
+                with st.spinner("Executing direct security scan..."):
+                    res = start_security_audit_api(repo_input.strip(), force_new=True)
+                    if res.get("status") == "completed":
+                        aid = res.get("audit_id")
+                        st.success(f"Audit completed: {aid} (Verdict: {res.get('final_verdict')})")
+                        if aid:
+                            st.session_state["active_security_report_id"] = aid
+                        st.rerun()
+                    else:
+                        st.error(f"Scan failed: {res.get('error', 'Unknown error')}")
+            else:
+                st.warning("Please enter a repository name or Git URL.")
+
+    recent_audits = fetch_security_audits(limit=5)
+    if recent_audits:
+        with st.expander(f"Recent Security Audits ({len(recent_audits)})", expanded=True):
+            for audit in recent_audits[:5]:
+                aid = audit.get("audit_id", "")
+                repo_src = audit.get("repo_source", "unknown")
+                status = audit.get("status", "unknown")
+                stage = audit.get("current_stage", "unknown")
+                verdict = audit.get("static_risk_verdict") or "PENDING"
+                report_path = audit.get("report_path")
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"**Repo:** `{repo_src}`  \n"
+                        f"**Audit ID:** `{aid}`  \n"
+                        f"**Status:** `{status}`  \n"
+                        f"**Stage:** `{stage}`  \n"
+                        f"**Verdict:** `{verdict}`"
+                    )
+
+                    btn_c1, btn_c2 = st.columns(2)
+                    with btn_c1:
+                        if status in ("rate_limited_paused", "in_progress"):
+                            if st.button("Resume Checkpoint", key=f"resume_audit_{aid}", use_container_width=True):
+                                with st.spinner("Resuming checkpoint..."):
+                                    res_res = resume_security_audit_api(aid)
+                                    if res_res.get("status") == "completed":
+                                        st.success(f"Audit {aid} resumed.")
+                                        st.session_state["active_security_report_id"] = aid
+                                        st.rerun()
+                                    else:
+                                        st.error("Failed to resume checkpoint.")
+                        elif status == "completed" and report_path:
+                            if st.button("View Report", key=f"view_report_{aid}", use_container_width=True):
+                                st.session_state["active_security_report_id"] = aid
+                                st.rerun()
+
+                    with btn_c2:
+                        if st.button("Delete", key=f"del_audit_{aid}", use_container_width=True):
+                            if delete_security_audit_api(aid):
+                                if st.session_state.get("active_security_report_id") == aid:
+                                    st.session_state.pop("active_security_report_id", None)
+                                st.rerun()
+                            else:
+                                st.error(f"Failed to delete audit {aid}")
+    else:
+        st.caption("No recent security audits found.")
+
 
 # ==========================================
 # MAIN PANEL: CHAT, CITATIONS & MCP TRACES
@@ -385,6 +525,32 @@ st.caption(
     "Ask about system architecture notes, inspect local Git status, or manage engineering tasks."
 )
 
+active_report_id = st.session_state.get("active_security_report_id")
+if active_report_id:
+    report_data = fetch_security_audit_report(active_report_id)
+    report_md = report_data.get("markdown", "")
+    with st.container(border=True):
+        st.subheader(f"Security Audit Report: {active_report_id}")
+        r_col1, r_col2 = st.columns([3, 1])
+        with r_col1:
+            st.download_button(
+                label="Download Markdown Report (.md)",
+                data=report_md,
+                file_name=f"SECURITY_AUDIT_{active_report_id}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with r_col2:
+            if st.button("Close Report", use_container_width=True):
+                st.session_state.pop("active_security_report_id", None)
+                st.rerun()
+
+        if report_md:
+            st.markdown(report_md)
+        else:
+            st.warning(f"Could not load report content for audit ID: {active_report_id}")
+    st.divider()
+
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"], avatar=get_avatar(msg["role"])):
         if msg.get("tool_traces"):
@@ -395,6 +561,25 @@ for msg in st.session_state.chat_history:
                     st.code(trace["output"], language="text")
 
         st.markdown(msg["content"])
+
+        if msg.get("checkpoint_paused"):
+            paused_aid = msg.get("audit_id", "unknown")
+            paused_stage = msg.get("current_stage", "unknown")
+            st.warning(
+                f"Security audit rate limit reached. Audit ID: {paused_aid} paused at stage: {paused_stage}. Checkpoint safely saved."
+            )
+            if st.button(
+                "Resume Audit from Checkpoint",
+                key=f"resume_checkpoint_msg_{paused_aid}",
+            ):
+                with st.spinner("Resuming audit from checkpoint..."):
+                    res_resume = resume_security_audit_api(paused_aid)
+                    if res_resume.get("status") == "completed":
+                        st.success(f"Audit {paused_aid} resumed to completion.")
+                        st.session_state["active_security_report_id"] = paused_aid
+                        st.rerun()
+                    else:
+                        st.error("Failed to resume audit.")
 
         # Render structured source citations (Knowledge Base + Web Search)
         if msg.get("citations"):
@@ -501,11 +686,13 @@ prompt = st.chat_input(
     "Type a command (e.g., 'Check my Second Brain for OCR queue tech and create a high-priority task')...",
     disabled=st.session_state.pending_interrupt is not None,
 )
+pending_prompt = st.session_state.pop("pending_chat_prompt", None)
+active_prompt = prompt or pending_prompt
 
-if prompt:
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
+if active_prompt:
+    st.session_state.chat_history.append({"role": "user", "content": active_prompt})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(active_prompt)
 
     with st.chat_message("assistant", avatar=get_avatar("assistant")):
         with st.spinner("Orchestrating LangGraph & MCP Servers..."):
@@ -514,15 +701,18 @@ if prompt:
                     f"{API_BASE_URL}/chat",
                     json={
                         "thread_id": st.session_state.thread_id,
-                        "message": prompt,
+                        "message": active_prompt,
                     },
-                    timeout=30,
+                    timeout=60,
                 ).json()
 
                 status = res.get("status")
                 traces = res.get("tool_traces", [])
                 citations = res.get("citations", [])
                 latency = res.get("latency_sec")
+                checkpoint_paused = res.get("checkpoint_paused", False)
+                audit_id = res.get("audit_id")
+                current_stage = res.get("current_stage")
 
                 if status == "interrupted_for_approval":
                     if traces:
@@ -546,6 +736,9 @@ if prompt:
                             "citations": citations,
                             "latency": latency,
                             "cached": res.get("cached", False),
+                            "checkpoint_paused": checkpoint_paused,
+                            "audit_id": audit_id,
+                            "current_stage": current_stage,
                         }
                     )
                     st.rerun()
